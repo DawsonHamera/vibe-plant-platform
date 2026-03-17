@@ -1,0 +1,21 @@
+{
+  "name": "vibe-plant-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:frontend": "npm run dev --workspace @vibe/frontend",
+    "dev:backend": "npm run start:dev --workspace @vibe/backend",
+    "mock:telemetry": "npm run mock:telemetry --workspace @vibe/backend",
+    "prod:up": "docker compose -f docker-compose.prod.yml up -d --build",
+    "prod:down": "docker compose -f docker-compose.prod.yml down",
+    "prod:logs": "docker compose -f docker-compose.prod.yml logs -f",
+    "build": "npm run build --workspace @vibe/shared && npm run build --workspace @vibe/backend && npm run build --workspace @vibe/frontend",
+    "lint": "npm run lint --workspace @vibe/shared && npm run lint --workspace @vibe/backend && npm run lint --workspace @vibe/frontend",
+    "typecheck": "npm run typecheck --workspace @vibe/shared && npm run typecheck --workspace @vibe/backend && npm run typecheck --workspace @vibe/frontend",
+    "test": "npm run test --workspace @vibe/shared && npm run test --workspace @vibe/backend && npm run test --workspace @vibe/frontend"
+  }
+}
