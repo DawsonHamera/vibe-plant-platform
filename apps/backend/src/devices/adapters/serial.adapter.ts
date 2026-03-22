@@ -238,7 +238,7 @@ export class SerialAdapter implements DeviceAdapter {
     const escapedTarget = this.escapePosixArg(target);
     const command =
       `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 1 time 20 >/dev/null 2>&1; ` +
-      `cat ${escapedTarget} | head -n 20"`;
+      `cat ${escapedTarget} | head -n 5"`;
 
     console.log(`[SERIAL DEBUG] probeChannelsOnUnix command: ${command}`);
     return this.runChannelProbe(command, target);
@@ -246,18 +246,25 @@ export class SerialAdapter implements DeviceAdapter {
 
   private runChannelProbe(command: string, target: string): Promise<AdapterChannelProbeResult> {
     return new Promise<AdapterChannelProbeResult>((resolve) => {
-      exec(command, { timeout: 5000 }, (error, stdout, stderr) => {
+      exec(command, { timeout: 12000 }, (error, stdout, stderr) => {
+        const sample = stdout.trim();
+
         if (error) {
           console.log(`[SERIAL DEBUG] probeChannels error for ${target}: ${stderr || error.message}`);
-          resolve({
-            ok: false,
-            channels: [],
-            message: `Unable to read serial payload from ${target}: ${stderr || error.message}`,
-          });
-          return;
+          console.log(`[SERIAL DEBUG] probeChannels error had sample length: ${sample.length}`);
+
+          // Some shells return non-zero (or hit timeout) even when serial data has already been read.
+          // If we captured payload, continue and try to parse it.
+          if (sample.length === 0) {
+            resolve({
+              ok: false,
+              channels: [],
+              message: `Unable to read serial payload from ${target}: ${stderr || error.message}`,
+            });
+            return;
+          }
         }
 
-        const sample = stdout.trim();
         console.log(`[SERIAL DEBUG] Raw output length: ${sample.length}, content raw:`, JSON.stringify(sample.substring(0, 200)));
         const channels = this.extractChannels(sample);
         if (channels.length === 0) {
