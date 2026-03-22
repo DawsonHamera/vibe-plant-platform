@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { exec } from "node:child_process";
 import { readdir, readlink } from "node:fs/promises";
+import { dirname, resolve as resolvePath } from "node:path";
 import {
   AdapterChannelProbeResult,
   AdapterTestResult,
@@ -121,19 +122,7 @@ export class SerialAdapter implements DeviceAdapter {
     }
 
     // Resolve symlinks to actual device file
-    let resolvedTarget = normalizedTarget;
-    if (normalizedTarget.includes("/dev/serial/by-")) {
-      try {
-        resolvedTarget = await readlink(normalizedTarget);
-        // If readlink returns relative path, prepend /dev/
-        if (!resolvedTarget.startsWith("/")) {
-          resolvedTarget = `/dev/${resolvedTarget}`;
-        }
-        console.log(`[SERIAL DEBUG] test: Resolved symlink ${normalizedTarget} -> ${resolvedTarget}`);
-      } catch (e) {
-        console.log(`[SERIAL DEBUG] test: Failed to resolve symlink: ${(e as Error).message}`);
-      }
-    }
+    const resolvedTarget = await this.resolveUnixSerialTarget(normalizedTarget, "test");
 
     if (process.platform === "win32") {
       return this.testOnWindows(normalizedTarget);
@@ -209,20 +198,7 @@ export class SerialAdapter implements DeviceAdapter {
     }
 
     // Resolve symlinks to actual device file
-    let resolvedTarget = normalizedTarget;
-    if (normalizedTarget.includes("/dev/serial/by-")) {
-      try {
-        resolvedTarget = await readlink(normalizedTarget);
-        // If readlink returns relative path, prepend /dev/
-        if (!resolvedTarget.startsWith("/")) {
-          resolvedTarget = `/dev/${resolvedTarget}`;
-        }
-        console.log(`[SERIAL DEBUG] Resolved symlink ${normalizedTarget} -> ${resolvedTarget}`);
-      } catch (e) {
-        console.log(`[SERIAL DEBUG] Failed to resolve symlink: ${(e as Error).message}`);
-        // Fall back to original target if resolution fails
-      }
-    }
+    const resolvedTarget = await this.resolveUnixSerialTarget(normalizedTarget, "probe");
 
     if (process.platform === "win32") {
       return this.probeChannelsOnWindows(normalizedTarget);
@@ -315,6 +291,25 @@ export class SerialAdapter implements DeviceAdapter {
     }
 
     return SerialAdapter.unixTargetPattern.test(target);
+  }
+
+  private async resolveUnixSerialTarget(target: string, context: "test" | "probe"): Promise<string> {
+    if (!target.includes("/dev/serial/by-")) {
+      return target;
+    }
+
+    try {
+      const linkTarget = await readlink(target);
+      const resolvedTarget = linkTarget.startsWith("/")
+        ? resolvePath(linkTarget)
+        : resolvePath(dirname(target), linkTarget);
+
+      console.log(`[SERIAL DEBUG] ${context}: Resolved symlink ${target} -> ${resolvedTarget}`);
+      return resolvedTarget;
+    } catch (e) {
+      console.log(`[SERIAL DEBUG] ${context}: Failed to resolve symlink: ${(e as Error).message}`);
+      return target;
+    }
   }
 
   private escapePosixArg(value: string): string {
