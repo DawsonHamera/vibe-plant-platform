@@ -339,13 +339,13 @@ const defaultDiagramEdges: Edge[] = [
 ];
 
 const defaultTargetByConnectionType: Record<DeviceProfile["connectionType"], string> = {
-  serial: "COM3",
+  serial: "/dev/ttyUSB0",
   network: "192.168.1.25:4000",
   bluetooth: "BT-SOIL-01",
 };
 
 const connectionTargetHint: Record<DeviceProfile["connectionType"], string> = {
-  serial: "Use COM format like COM3.",
+  serial: "Use COM format (COM3) on Windows or /dev/ttyUSB0 on Linux/Raspberry Pi.",
   network: "Use IPv4:port like 192.168.1.25:4000.",
   bluetooth: "Use BT-NAME-N format like BT-SOIL-01.",
 };
@@ -944,7 +944,7 @@ export function App(): JSX.Element {
   const [draftZone, setDraftZone] = useState("Living Room");
   const [deviceName, setDeviceName] = useState("Living Room Kit");
   const [deviceType, setDeviceType] = useState<"serial" | "network" | "bluetooth">("serial");
-  const [deviceTarget, setDeviceTarget] = useState("COM3");
+  const [deviceTarget, setDeviceTarget] = useState(defaultTargetByConnectionType.serial);
   const [detectedChannels, setDetectedChannels] = useState<string[]>([]);
   const [channelProbeResult, setChannelProbeResult] = useState<ChannelProbeResult | null>(null);
   const [channelProbeLoading, setChannelProbeLoading] = useState(false);
@@ -2044,7 +2044,7 @@ export function App(): JSX.Element {
     setDeviceEditorOpen(true);
     setDeviceName("Living Room Kit");
     setDeviceType("serial");
-    setDeviceTarget("COM3");
+    setDeviceTarget(defaultTargetByConnectionType.serial);
     setDeviceChannelAssignments([]);
     setChannelProbeResult(null);
     setDetectedChannels([]);

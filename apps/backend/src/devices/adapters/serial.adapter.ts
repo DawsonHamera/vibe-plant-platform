@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { exec } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import {
   AdapterChannelProbeResult,
   AdapterTestResult,
@@ -10,6 +11,10 @@ import {
 export class SerialAdapter implements DeviceAdapter {
   readonly type = "serial" as const;
 
+  private static readonly windowsTargetPattern = /^COM\d+$/i;
+  private static readonly unixTargetPattern =
+    /^\/dev\/(?:tty(?:USB|ACM|AMA|S|THS|XRUSB|GS)\d+|rfcomm\d+|cu\.[A-Za-z0-9._-]+|serial\/by-(?:id|path)\/[A-Za-z0-9._:+-]+)$/;
+
   async discover(): Promise<string[]> {
     const override = process.env.VIBE_SERIAL_PORTS;
     if (override) {
@@ -17,6 +22,10 @@ export class SerialAdapter implements DeviceAdapter {
         .split(",")
         .map((value) => value.trim())
         .filter((value) => value.length > 0);
+    }
+
+    if (process.platform === "linux" || process.platform === "darwin") {
+      return this.discoverFromUnixDevices();
     }
 
     if (process.platform !== "win32") {
@@ -38,9 +47,35 @@ export class SerialAdapter implements DeviceAdapter {
           return;
         }
 
-        resolve(this.normalizePorts(stdout));
+        resolve(this.normalizeWindowsPorts(stdout));
       });
     });
+  }
+
+  private async discoverFromUnixDevices(): Promise<string[]> {
+    const [rootDevices, byIdDevices, byPathDevices] = await Promise.all([
+      this.listUnixSerialEntries("/dev", /^(tty(?:USB|ACM|AMA|S|THS|XRUSB|GS)\d+|rfcomm\d+|cu\.[A-Za-z0-9._-]+)$/),
+      this.listUnixSerialEntries("/dev/serial/by-id", /^[^/]+$/),
+      this.listUnixSerialEntries("/dev/serial/by-path", /^[^/]+$/),
+    ]);
+
+    const normalized = [...rootDevices, ...byIdDevices, ...byPathDevices]
+      .filter((value) => this.isValidTargetFormat(value))
+      .sort((a, b) => a.localeCompare(b));
+
+    return Array.from(new Set(normalized));
+  }
+
+  private async listUnixSerialEntries(directory: string, matcher: RegExp): Promise<string[]> {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true });
+      return entries
+        .filter((entry) => (entry.isCharacterDevice?.() ?? false) || entry.isSymbolicLink())
+        .filter((entry) => matcher.test(entry.name))
+        .map((entry) => `${directory}/${entry.name}`);
+    } catch {
+      return [];
+    }
   }
 
   private discoverFromRegistry(): Promise<string[]> {
@@ -55,16 +90,16 @@ export class SerialAdapter implements DeviceAdapter {
         }
 
         const ports = (stdout.match(/COM\d+/gi) ?? []).join(",");
-        resolve(this.normalizePorts(ports));
+        resolve(this.normalizeWindowsPorts(ports));
       });
     });
   }
 
-  private normalizePorts(raw: string): string[] {
+  private normalizeWindowsPorts(raw: string): string[] {
     const ports = raw
       .split(/[\s,]+/)
       .map((value) => value.trim())
-      .filter((value) => /^COM\d+$/i.test(value))
+      .filter((value) => SerialAdapter.windowsTargetPattern.test(value))
       .map((value) => value.toUpperCase())
       .sort((a, b) => {
         const aNum = Number(a.replace(/\D/g, ""));
@@ -76,7 +111,8 @@ export class SerialAdapter implements DeviceAdapter {
   }
 
   async test(target: string): Promise<AdapterTestResult> {
-    if (!/^COM\d+$/i.test(target)) {
+    const normalizedTarget = target.trim();
+    if (!this.isValidTargetFormat(normalizedTarget)) {
       return {
         ok: false,
         latencyMs: 0,
@@ -84,14 +120,22 @@ export class SerialAdapter implements DeviceAdapter {
       };
     }
 
-    if (process.platform !== "win32") {
-      return {
-        ok: false,
-        latencyMs: 0,
-        message: "Serial probing is currently supported on Windows hosts only",
-      };
+    if (process.platform === "win32") {
+      return this.testOnWindows(normalizedTarget);
     }
 
+    if (process.platform === "linux" || process.platform === "darwin") {
+      return this.testOnUnix(normalizedTarget);
+    }
+
+    return {
+      ok: false,
+      latencyMs: 0,
+      message: `Serial probing is not implemented for platform ${process.platform}`,
+    };
+  }
+
+  private testOnWindows(target: string): Promise<AdapterTestResult> {
     const startedAt = Date.now();
     return new Promise<AdapterTestResult>((resolve) => {
       exec(`mode ${target}`, { timeout: 1200 }, (error) => {
@@ -113,8 +157,35 @@ export class SerialAdapter implements DeviceAdapter {
     });
   }
 
+  private testOnUnix(target: string): Promise<AdapterTestResult> {
+    const sttyFlag = process.platform === "darwin" ? "-f" : "-F";
+    const escapedTarget = this.escapePosixArg(target);
+    const command = `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo >/dev/null 2>&1"`;
+    const startedAt = Date.now();
+
+    return new Promise<AdapterTestResult>((resolve) => {
+      exec(command, { timeout: 1500 }, (error) => {
+        if (error) {
+          resolve({
+            ok: false,
+            latencyMs: 0,
+            message: `Serial probe failed for ${target}. Ensure the device path exists and user has serial permissions.`,
+          });
+          return;
+        }
+
+        resolve({
+          ok: true,
+          latencyMs: Date.now() - startedAt,
+          message: `Serial handshake succeeded on ${target}`,
+        });
+      });
+    });
+  }
+
   async probeChannels(target: string): Promise<AdapterChannelProbeResult> {
-    if (!/^COM\d+$/i.test(target)) {
+    const normalizedTarget = target.trim();
+    if (!this.isValidTargetFormat(normalizedTarget)) {
       return {
         ok: false,
         channels: [],
@@ -122,14 +193,22 @@ export class SerialAdapter implements DeviceAdapter {
       };
     }
 
-    if (process.platform !== "win32") {
-      return {
-        ok: false,
-        channels: [],
-        message: "Serial channel probing is currently supported on Windows hosts only",
-      };
+    if (process.platform === "win32") {
+      return this.probeChannelsOnWindows(normalizedTarget);
     }
 
+    if (process.platform === "linux" || process.platform === "darwin") {
+      return this.probeChannelsOnUnix(normalizedTarget);
+    }
+
+    return {
+      ok: false,
+      channels: [],
+      message: `Serial channel probing is not implemented for platform ${process.platform}`,
+    };
+  }
+
+  private probeChannelsOnWindows(target: string): Promise<AdapterChannelProbeResult> {
     const script = [
       `$port = New-Object System.IO.Ports.SerialPort '${target}',9600,'None',8,'one'`,
       "$port.ReadTimeout = 1500",
@@ -142,8 +221,22 @@ export class SerialAdapter implements DeviceAdapter {
       "Write-Output $raw",
     ].join("; ");
 
-    const command = `powershell.exe -NoProfile -Command \"${script.replace(/\"/g, '\\\"')}\"`;
+    const command = `powershell.exe -NoProfile -Command "${script.replace(/"/g, '\\"')}"`;
 
+    return this.runChannelProbe(command, target);
+  }
+
+  private probeChannelsOnUnix(target: string): Promise<AdapterChannelProbeResult> {
+    const sttyFlag = process.platform === "darwin" ? "-f" : "-F";
+    const escapedTarget = this.escapePosixArg(target);
+    const command =
+      `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 0 time 12 >/dev/null 2>&1; ` +
+      `cat ${escapedTarget} | head -n 20"`;
+
+    return this.runChannelProbe(command, target);
+  }
+
+  private runChannelProbe(command: string, target: string): Promise<AdapterChannelProbeResult> {
     return new Promise<AdapterChannelProbeResult>((resolve) => {
       exec(command, { timeout: 5000 }, (error, stdout, stderr) => {
         if (error) {
@@ -176,6 +269,22 @@ export class SerialAdapter implements DeviceAdapter {
         });
       });
     });
+  }
+
+  private isValidTargetFormat(target: string): boolean {
+    if (SerialAdapter.windowsTargetPattern.test(target)) {
+      return true;
+    }
+
+    if (target.includes("..")) {
+      return false;
+    }
+
+    return SerialAdapter.unixTargetPattern.test(target);
+  }
+
+  private escapePosixArg(value: string): string {
+    return `'${value.replace(/'/g, `'"'"'`)}'`;
   }
 
   private extractChannels(raw: string): string[] {

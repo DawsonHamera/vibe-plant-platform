@@ -6,9 +6,13 @@ import { SerialAdapter } from "./serial.adapter";
 describe("Device adapters", () => {
   it("validates serial targets", async () => {
     const adapter = new SerialAdapter();
-    const validTargetResult = await adapter.test("COM3");
-    expect(validTargetResult.message.length).toBeGreaterThan(0);
-    expect(typeof validTargetResult.ok).toBe("boolean");
+    const windowsTargetResult = await adapter.test("COM3");
+    expect(windowsTargetResult.message.length).toBeGreaterThan(0);
+    expect(typeof windowsTargetResult.ok).toBe("boolean");
+
+    const linuxTargetResult = await adapter.test("/dev/ttyUSB0");
+    expect(linuxTargetResult.message.length).toBeGreaterThan(0);
+    expect(typeof linuxTargetResult.ok).toBe("boolean");
 
     await expect(adapter.test("tty0")).resolves.toMatchObject({ ok: false });
   });

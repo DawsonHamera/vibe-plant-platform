@@ -100,6 +100,7 @@ API notes:
 - `GET /telemetry/latest` returns latest telemetry for all plants; with `plantId`, it returns that plant's latest point or `null` if none exists.
 - `GET /telemetry/stats` returns ingest volume, latest telemetry cache size, and latest lookup hit/miss metrics.
 - `POST /devices/profiles/:id/validate` runs no-code onboarding checks for required channel mappings and moisture calibration sanity.
+- Serial targets support both Windows (`COM3`) and Linux/macOS paths (`/dev/ttyUSB0`, `/dev/ttyACM0`, `/dev/serial/by-id/...`).
 - `GET /automation/timeline` supports optional filters `ruleId`, `plantId`, and `source`, plus `limit` (default `50`, max `200`), ordered newest-first.
 - `GET /automation/runtime-status` returns current runtime health/loop metadata for the automation status panel.
 - `POST /automation/diagram-scopes/:scope/apply` compiles diagram nodes/edges into executable automation rules used by runtime and timeline.
@@ -284,7 +285,7 @@ Install (mobile):
    - ensure no backend port conflict (`EADDRINUSE`)
    - ensure tunnel domain is included in `CORS_ORIGINS`
    - hard-refresh to load latest frontend assets after websocket changes
-- If COM/serial devices are unavailable in production, use hybrid mode (backend on host + frontend in Docker).
+- If serial devices are unavailable in production, use hybrid mode (backend on host + frontend in Docker).
 
 ## CI
 - GitHub Actions workflow at `.github/workflows/ci.yml` is manual (`workflow_dispatch`) and focused on frontend validation/build artifact flow.
