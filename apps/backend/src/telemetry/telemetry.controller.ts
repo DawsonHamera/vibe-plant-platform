@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -88,12 +89,26 @@ export class TelemetryController {
   ingest(@Body() dto: CreateTelemetryDto): { ok: boolean } {
     this.plantsService.getById(dto.plantId);
 
+    const hasAnyMeasurement =
+      dto.moisture !== undefined ||
+      dto.light !== undefined ||
+      dto.temperature !== undefined ||
+      dto.humidity !== undefined ||
+      dto.reservoirLevel !== undefined;
+    if (!hasAnyMeasurement) {
+      throw new BadRequestException(
+        "Telemetry payload must include at least one measurement (moisture, light, temperature, humidity, reservoirLevel).",
+      );
+    }
+
     const point: TelemetryPoint = {
       plantId: dto.plantId,
-      moisture: dto.moisture,
-      light: dto.light,
-      temperature: dto.temperature,
       capturedAt: dto.capturedAt || new Date().toISOString(),
+      ...(dto.moisture !== undefined ? { moisture: dto.moisture } : {}),
+      ...(dto.light !== undefined ? { light: dto.light } : {}),
+      ...(dto.temperature !== undefined ? { temperature: dto.temperature } : {}),
+      ...(dto.humidity !== undefined ? { humidity: dto.humidity } : {}),
+      ...(dto.reservoirLevel !== undefined ? { reservoirLevel: dto.reservoirLevel } : {}),
     };
 
     this.telemetryState.record(point);

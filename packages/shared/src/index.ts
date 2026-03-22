@@ -30,10 +30,14 @@ export interface DailyCareDecision {
 
 export interface TelemetryPoint {
   plantId: string;
-  moisture: number;
-  light: number;
-  temperature: number;
+  moisture?: number;
+  light?: number;
+  temperature?: number;
+  humidity?: number;
+  reservoirLevel?: number;
   capturedAt: string;
+  sourceProfileId?: string;
+  sourceProfileName?: string;
 }
 
 export function calculatePlantRisk(moisture: number, temperature: number): number {

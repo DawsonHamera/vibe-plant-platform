@@ -1,0 +1,1 @@
+ALTER TABLE device_profiles ADD COLUMN channel_assignments TEXT NOT NULL DEFAULT '[]';

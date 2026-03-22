@@ -1,9 +1,13 @@
 import "reflect-metadata";
+import { config as dotenvConfig } from "dotenv";
 import { ValidationPipe } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { mkdirSync } from "node:fs";
 import { AppModule } from "./app.module";
 import { getRuntimeConfig } from "./config/runtime-config";
+
+// Load .env from root directory (../../.env from apps/backend context)
+dotenvConfig({ path: "../../.env" });
 
 async function bootstrap(): Promise<void> {
   const runtime = getRuntimeConfig();
@@ -17,6 +21,7 @@ async function bootstrap(): Promise<void> {
 
   app.enableCors({
     origin: runtime.corsOrigins,
+    credentials: true,
   });
   app.useGlobalPipes(
     new ValidationPipe({

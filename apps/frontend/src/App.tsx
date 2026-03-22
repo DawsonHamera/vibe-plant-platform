@@ -19,6 +19,8 @@ import ReactFlow, {
 import "reactflow/dist/style.css";
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:3000").replace(/\/$/, "");
+const authDeviceKey = "vibe_auth_device";
+const unauthorizedEvent = "vibe:auth-unauthorized";
 
 type DailyDecision = {
   date: string;
@@ -28,10 +30,27 @@ type DailyDecision = {
 };
 
 type TelemetryView = {
-  moisture: number;
-  light: number;
-  temperature: number;
+  moisture?: number;
+  light?: number;
+  temperature?: number;
+  humidity?: number;
+  reservoirLevel?: number;
   capturedAt: string;
+  sourceProfileId?: string;
+  sourceProfileName?: string;
+};
+
+type DeviceMeasurementType = "moisture" | "temperature" | "light" | "humidity" | "reservoirLevel";
+
+type DeviceChannelAssignment = {
+  channel: string;
+  plantId: string;
+  measurementType: DeviceMeasurementType;
+  calibration?: {
+    inputMin?: number;
+    inputMax?: number;
+    clamp?: boolean;
+  };
 };
 
 type TelemetryStats = {
@@ -54,9 +73,18 @@ type DeviceProfile = {
   name: string;
   connectionType: "serial" | "network" | "bluetooth";
   transportTarget: string;
-  channelMap: Record<string, string>;
-  calibration: Record<string, number>;
+  channelMap?: Record<string, string>;
+  calibration?: Record<string, number>;
+  plantIds?: string[];
+  channelAssignments: DeviceChannelAssignment[];
   isLive: boolean;
+};
+
+type ChannelProbeResult = {
+  ok: boolean;
+  channels: string[];
+  message: string;
+  sample?: string;
 };
 
 type DeviceProfileValidationIssue = {
@@ -98,6 +126,10 @@ type TimelineFilters = {
   limit: string;
 };
 
+type SessionStatus = {
+  authenticated: boolean;
+};
+
 type AutomationRuntimeStatus = {
   lastRunTime: string | null;
   lastExecutionCount: number;
@@ -114,14 +146,13 @@ type AutomationRuntimeHistoryEntry = {
   blockedDailyLimitCount: number;
 };
 
-type DeviceProfileEditDraft = {
-  id: string;
-  name: string;
-  moistureDry: string;
-  moistureWet: string;
-  moistureChannel: string;
-  lightChannel: string;
-  temperatureChannel: string;
+type DeviceChannelAssignmentDraft = {
+  channel: string;
+  plantId: string;
+  measurementType: DeviceMeasurementType;
+  inputMin: string;
+  inputMax: string;
+  clamp: boolean;
 };
 
 type PlantEditDraft = {
@@ -157,6 +188,7 @@ type DiagramNodeData = {
   seconds?: number;
   cooldownMinutes?: number;
   maxDailyRuntimeSeconds?: number;
+  readOnly?: boolean;
   onPatch?: (partial: Partial<DiagramNodeData>) => void;
   onLabelChange?: (label: string) => void;
 };
@@ -171,13 +203,6 @@ type FlowValidationIssue = {
   code: string;
   message: string;
   nodeId?: string;
-};
-
-type DiagramPreviewResponse = {
-  scope: string;
-  compiledRuleCount: number;
-  compiledRules: Array<Record<string, unknown>>;
-  issues: FlowValidationIssue[];
 };
 
 type DiagramApplyResponse = {
@@ -211,7 +236,7 @@ const defaultDiagramNodes: Node<DiagramNodeData>[] = [
   {
     id: "start",
     position: { x: 140, y: 80 },
-    data: { label: "Any Plant", kind: "trigger", plantId: "" },
+    data: { label: "Trigger", kind: "trigger", plantId: "", metric: "moisture", operator: "<", value: 35 },
     type: "flowNode",
   },
   {
@@ -252,33 +277,160 @@ const defaultDiagramEdges: Edge[] = [
   },
 ];
 
+const defaultTargetByConnectionType: Record<DeviceProfile["connectionType"], string> = {
+  serial: "COM3",
+  network: "192.168.1.25:4000",
+  bluetooth: "BT-SOIL-01",
+};
+
+const connectionTargetHint: Record<DeviceProfile["connectionType"], string> = {
+  serial: "Use COM format like COM3.",
+  network: "Use IPv4:port like 192.168.1.25:4000.",
+  bluetooth: "Use BT-NAME-N format like BT-SOIL-01.",
+};
+
+const measurementTypeOptions: DeviceMeasurementType[] = [
+  "moisture",
+  "temperature",
+  "light",
+  "humidity",
+  "reservoirLevel",
+];
+
+const createAssignmentDraft = (channel: string): DeviceChannelAssignmentDraft => ({
+  channel,
+  plantId: "",
+  measurementType: "moisture",
+  inputMin: "",
+  inputMax: "",
+  clamp: true,
+});
+
+const toAssignmentDraft = (assignment: DeviceChannelAssignment): DeviceChannelAssignmentDraft => ({
+  channel: assignment.channel,
+  plantId: assignment.plantId,
+  measurementType: assignment.measurementType,
+  inputMin: assignment.calibration?.inputMin === undefined ? "" : String(assignment.calibration.inputMin),
+  inputMax: assignment.calibration?.inputMax === undefined ? "" : String(assignment.calibration.inputMax),
+  clamp: assignment.calibration?.clamp !== false,
+});
+
+const toChannelAssignmentsPayload = (
+  drafts: DeviceChannelAssignmentDraft[],
+): DeviceChannelAssignment[] => {
+  return drafts
+    .filter((draft) => draft.channel.trim().length > 0 && draft.plantId.trim().length > 0)
+    .map((draft) => {
+      const inputMin = Number(draft.inputMin);
+      const inputMax = Number(draft.inputMax);
+
+      const calibration =
+        draft.measurementType === "moisture"
+          ? {
+              ...(Number.isFinite(inputMin) ? { inputMin } : {}),
+              ...(Number.isFinite(inputMax) ? { inputMax } : {}),
+              clamp: draft.clamp,
+            }
+          : undefined;
+
+      return {
+        channel: draft.channel.trim(),
+        plantId: draft.plantId,
+        measurementType: draft.measurementType,
+        ...(calibration ? { calibration } : {}),
+      };
+    });
+};
+
 function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Element {
   const kind = data.kind ?? "trigger";
   const canTarget = kind !== "trigger";
   const canSource = kind !== "action";
+  const readOnly = data.readOnly === true;
 
   return (
     <div className={`flow-node-card ${selected ? "selected" : ""}`}>
       {canTarget ? <Handle type="target" position={Position.Left} className="flow-handle flow-handle-target" /> : null}
       {canSource ? <Handle type="source" position={Position.Right} className="flow-handle flow-handle-source" /> : null}
-      <div className="flow-node-head">
-        <input
-          className="flow-node-input flow-node-label-input nodrag nopan"
-          value={data.label ?? ""}
-          onChange={(event) => data.onLabelChange?.(event.target.value)}
-          aria-label={`${kind} label`}
-        />
-        <span className="flow-node-kind">{kind}</span>
-      </div>
+      {kind === "action" ? (
+        <div className="flow-node-head">
+          <input
+            className="flow-node-input flow-node-label-input nodrag nopan"
+            value={data.label ?? ""}
+            onChange={(event) => data.onLabelChange?.(event.target.value)}
+            aria-label={`${kind} label`}
+            disabled={readOnly}
+          />
+          <span className="flow-node-kind">{kind}</span>
+        </div>
+      ) : (
+        <div className="flow-node-head flow-node-head-minimal">
+          <span className="flow-node-kind">{kind}</span>
+        </div>
+      )}
 
       {kind === "trigger" ? (
-        <div className="trigger-config-row">
-          {data.plantImageUrl ? <img className="trigger-plant-icon" src={data.plantImageUrl} alt="Selected plant" /> : null}
+        <div className="flow-node-grid condition-grid flow-node-plant-first">
+          <div className="trigger-config-row">
+            {data.plantImageUrl ? <img className="trigger-plant-icon" src={data.plantImageUrl} alt="Selected plant" /> : null}
+            <select
+              className="flow-node-input nodrag nopan"
+              value={data.plantId ?? ""}
+              onChange={(event) => data.onPatch?.({ plantId: event.target.value })}
+              aria-label="Trigger plant"
+              disabled={readOnly}
+            >
+              <option value="">Any plant</option>
+              {(data.plantOptions ?? []).map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <select
+            className="flow-node-input nodrag nopan"
+            value={data.metric ?? "moisture"}
+            onChange={(event) => data.onPatch?.({ metric: event.target.value as DiagramMetric })}
+            aria-label="Trigger metric"
+            disabled={readOnly}
+          >
+            <option value="moisture">moisture</option>
+            <option value="light">light</option>
+            <option value="temperature">temperature</option>
+          </select>
+          <select
+            className="flow-node-input nodrag nopan"
+            value={data.operator ?? "<"}
+            onChange={(event) => data.onPatch?.({ operator: event.target.value as DiagramOperator })}
+            aria-label="Trigger operator"
+            disabled={readOnly}
+          >
+            <option value="<">&lt;</option>
+            <option value="<=">&lt;=</option>
+            <option value=">">&gt;</option>
+            <option value=">=">&gt;=</option>
+          </select>
+          <input
+            type="number"
+            className="flow-node-input nodrag nopan"
+            value={data.value ?? 35}
+            onChange={(event) => data.onPatch?.({ value: Number(event.target.value) })}
+            placeholder="trigger threshold"
+            aria-label="Trigger threshold"
+            disabled={readOnly}
+          />
+        </div>
+      ) : null}
+
+      {kind === "condition" ? (
+        <div className="flow-node-grid condition-grid flow-node-plant-first">
           <select
             className="flow-node-input nodrag nopan"
             value={data.plantId ?? ""}
             onChange={(event) => data.onPatch?.({ plantId: event.target.value })}
-            aria-label="Trigger plant"
+            aria-label="Condition plant"
+            disabled={readOnly}
           >
             <option value="">Any plant</option>
             {(data.plantOptions ?? []).map((option) => (
@@ -287,16 +439,12 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
               </option>
             ))}
           </select>
-        </div>
-      ) : null}
-
-      {kind === "condition" ? (
-        <div className="flow-node-grid condition-grid">
           <select
             className="flow-node-input nodrag nopan"
             value={data.metric ?? "moisture"}
             onChange={(event) => data.onPatch?.({ metric: event.target.value as DiagramMetric })}
             aria-label="Condition metric"
+            disabled={readOnly}
           >
             <option value="moisture">moisture</option>
             <option value="light">light</option>
@@ -307,6 +455,7 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             value={data.operator ?? "<"}
             onChange={(event) => data.onPatch?.({ operator: event.target.value as DiagramOperator })}
             aria-label="Condition operator"
+            disabled={readOnly}
           >
             <option value="<">&lt;</option>
             <option value="<=">&lt;=</option>
@@ -320,6 +469,7 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             onChange={(event) => data.onPatch?.({ value: Number(event.target.value) })}
             placeholder="threshold"
             aria-label="Condition threshold"
+            disabled={readOnly}
           />
         </div>
       ) : null}
@@ -331,11 +481,13 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             value={data.target ?? "pump"}
             onChange={(event) => data.onPatch?.({ target: event.target.value as DiagramActionTarget })}
             aria-label="Action target"
+            disabled={readOnly}
           >
             <option value="pump">pump</option>
             <option value="mister">mister</option>
             <option value="relay">relay</option>
           </select>
+          <label className="flow-node-field-label">Seconds</label>
           <input
             type="number"
             min={1}
@@ -344,7 +496,9 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             onChange={(event) => data.onPatch?.({ seconds: Number(event.target.value) })}
             placeholder="seconds"
             aria-label="Action seconds"
+            disabled={readOnly}
           />
+          <label className="flow-node-field-label">Cooldown Min</label>
           <input
             type="number"
             min={1}
@@ -353,7 +507,9 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             onChange={(event) => data.onPatch?.({ cooldownMinutes: Number(event.target.value) })}
             placeholder="cooldown min"
             aria-label="Action cooldown"
+            disabled={readOnly}
           />
+          <label className="flow-node-field-label">Max Daily Sec</label>
           <input
             type="number"
             min={1}
@@ -362,6 +518,7 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
             onChange={(event) => data.onPatch?.({ maxDailyRuntimeSeconds: Number(event.target.value) })}
             placeholder="max daily sec"
             aria-label="Action max daily runtime"
+            disabled={readOnly}
           />
         </div>
       ) : null}
@@ -372,6 +529,14 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
 const toNumber = (value: unknown, fallback = 0): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const formatMeasurement = (value: number | undefined, unit = ""): string => {
+  if (value === undefined || Number.isNaN(value)) {
+    return "-";
+  }
+
+  return `${value}${unit}`;
 };
 
 const normalizeRuntimeStatus = (payload: unknown): AutomationRuntimeStatus => {
@@ -450,6 +615,18 @@ const resolvePlantImageUrl = (imageUrl: string | undefined): string | null => {
 };
 
 export function App(): JSX.Element {
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authPassphrase, setAuthPassphrase] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [securityModalOpen, setSecurityModalOpen] = useState(false);
+  const [currentPassphraseDraft, setCurrentPassphraseDraft] = useState("");
+  const [newPassphraseDraft, setNewPassphraseDraft] = useState("");
+  const [confirmPassphraseDraft, setConfirmPassphraseDraft] = useState("");
+  const [securitySaving, setSecuritySaving] = useState(false);
+  const [securityError, setSecurityError] = useState<string | null>(null);
+  const [securitySuccess, setSecuritySuccess] = useState<string | null>(null);
   const [plants, setPlants] = useState<PlantRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [decision, setDecision] = useState<DailyDecision | null>(null);
@@ -464,7 +641,6 @@ export function App(): JSX.Element {
   const [discovery, setDiscovery] = useState<DeviceDiscovery[]>([]);
   const [deviceProfiles, setDeviceProfiles] = useState<DeviceProfile[]>([]);
   const [rules, setRules] = useState<AutomationRule[]>([]);
-  const [ruleToggleInFlightId, setRuleToggleInFlightId] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<AutomationTimelineEvent[]>([]);
   const [timelineFilters, setTimelineFilters] = useState<TimelineFilters>({
     ruleId: "",
@@ -487,25 +663,33 @@ export function App(): JSX.Element {
   const [deviceName, setDeviceName] = useState("Living Room Kit");
   const [deviceType, setDeviceType] = useState<"serial" | "network" | "bluetooth">("serial");
   const [deviceTarget, setDeviceTarget] = useState("COM3");
-  const [deviceMoistureChannel, setDeviceMoistureChannel] = useState("ch0");
-  const [deviceLightChannel, setDeviceLightChannel] = useState("ch1");
-  const [deviceTemperatureChannel, setDeviceTemperatureChannel] = useState("ch2");
-  const [deviceMoistureDry, setDeviceMoistureDry] = useState("900");
-  const [deviceMoistureWet, setDeviceMoistureWet] = useState("300");
-  const [ruleName, setRuleName] = useState("Auto Water When Dry");
+  const [detectedChannels, setDetectedChannels] = useState<string[]>([]);
+  const [channelProbeResult, setChannelProbeResult] = useState<ChannelProbeResult | null>(null);
+  const [channelProbeLoading, setChannelProbeLoading] = useState(false);
+  const [channelProbeError, setChannelProbeError] = useState<string | null>(null);
+  const [deviceChannelAssignments, setDeviceChannelAssignments] = useState<DeviceChannelAssignmentDraft[]>([]);
+  const [deviceEditorOpen, setDeviceEditorOpen] = useState(false);
+  const [deviceEditorProfileId, setDeviceEditorProfileId] = useState<string | null>(null);
+  const [deviceEditorSaving, setDeviceEditorSaving] = useState(false);
+  const [connectionSectionOpen, setConnectionSectionOpen] = useState(true);
+  const [assignmentSectionOpen, setAssignmentSectionOpen] = useState(true);
   const [connectionTest, setConnectionTest] = useState<ConnectionTestResult | null>(null);
+  const [profileTestInFlightId, setProfileTestInFlightId] = useState<string | null>(null);
+  const [profileConnectionTests, setProfileConnectionTests] = useState<Record<string, ConnectionTestResult>>({});
+  const [hardwareDiscoveryLoading, setHardwareDiscoveryLoading] = useState(false);
+  const [hardwareDiscoveryError, setHardwareDiscoveryError] = useState<string | null>(null);
+  const [profileDeleteInFlightId, setProfileDeleteInFlightId] = useState<string | null>(null);
+  const [deletingAllProfiles, setDeletingAllProfiles] = useState(false);
+  const [lastTelemetryEventAt, setLastTelemetryEventAt] = useState<string | null>(null);
   const [lastEvaluationExecutions, setLastEvaluationExecutions] = useState<number | null>(null);
-  const [activePanel, setActivePanel] = useState<"overview" | "plants" | "devices" | "automation" | "diagrams">(
+  const [activePanel, setActivePanel] = useState<"overview" | "plants" | "devices" | "logs" | "flows">(
     "overview",
   );
   const [quickActionsOpen, setQuickActionsOpen] = useState(false);
   const [isPlantModalOpen, setIsPlantModalOpen] = useState(false);
-  const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
   const [plantEditDraft, setPlantEditDraft] = useState<PlantEditDraft | null>(null);
   const [plantEditSaving, setPlantEditSaving] = useState(false);
   const [plantEditError, setPlantEditError] = useState<string | null>(null);
-  const [profileEditDraft, setProfileEditDraft] = useState<DeviceProfileEditDraft | null>(null);
-  const [profileEditSaving, setProfileEditSaving] = useState(false);
   const [profileValidation, setProfileValidation] = useState<Record<string, DeviceProfileValidationResult>>({});
   const [profileValidationInFlightId, setProfileValidationInFlightId] = useState<string | null>(null);
   const [profileValidationError, setProfileValidationError] = useState<string | null>(null);
@@ -523,9 +707,8 @@ export function App(): JSX.Element {
   const [diagramApplyInFlight, setDiagramApplyInFlight] = useState(false);
   const [diagramApplyError, setDiagramApplyError] = useState<string | null>(null);
   const [diagramApplyResult, setDiagramApplyResult] = useState<string | null>(null);
-  const [diagramPreviewInFlight, setDiagramPreviewInFlight] = useState(false);
-  const [diagramPreviewResult, setDiagramPreviewResult] = useState<string | null>(null);
   const [diagramPreviewIssues, setDiagramPreviewIssues] = useState<FlowValidationIssue[]>([]);
+  const [flowLiveMode, setFlowLiveMode] = useState(false);
   const [diagramConnectionError, setDiagramConnectionError] = useState<string | null>(null);
   const [healthDetails, setHealthDetails] = useState<PlatformHealthDetails | null>(null);
   const [healthLoading, setHealthLoading] = useState(false);
@@ -535,6 +718,10 @@ export function App(): JSX.Element {
   const plantLookup = useMemo(
     () => new Map(plants.map((plant) => [plant.id, plant.nickname])),
     [plants],
+  );
+  const profileLookup = useMemo(
+    () => new Map(deviceProfiles.map((profile) => [profile.id, profile])),
+    [deviceProfiles],
   );
 
   const sortedTimeline = useMemo(
@@ -584,13 +771,23 @@ export function App(): JSX.Element {
         ...node,
         data: {
           ...node.data,
+          readOnly: flowLiveMode,
           plantOptions: diagramPlantOptions,
           plantImageUrl: diagramPlantOptions.find((option) => option.id === node.data.plantId)?.imageUrl,
           onPatch: (partial: Partial<DiagramNodeData>) => updateDiagramNodeDataById(node.id, partial),
           onLabelChange: (label: string) => updateDiagramNodeDataById(node.id, { label }),
         },
       })),
-    [diagramNodes, diagramPlantOptions, updateDiagramNodeDataById],
+    [diagramNodes, diagramPlantOptions, flowLiveMode, updateDiagramNodeDataById],
+  );
+
+  const diagramEdgesForCanvas = useMemo(
+    () =>
+      diagramEdges.map((edge) => ({
+        ...edge,
+        animated: flowLiveMode,
+      })),
+    [diagramEdges, flowLiveMode],
   );
 
   const buildTimelineQueryParams = (filters: TimelineFilters): URLSearchParams => {
@@ -766,6 +963,7 @@ export function App(): JSX.Element {
 
       setDiagramNodes(nextNodes);
       setDiagramEdges(nextEdges);
+      setFlowLiveMode(false);
       if (typeof payload.updatedAt === "string" && payload.updatedAt.length > 0) {
         setDiagramLastSavedAt(payload.updatedAt);
       }
@@ -773,6 +971,7 @@ export function App(): JSX.Element {
       setDiagramSyncError(error instanceof Error ? error.message : "Unable to load diagram from backend.");
       setDiagramNodes(defaultDiagramNodes);
       setDiagramEdges(defaultDiagramEdges);
+      setFlowLiveMode(false);
     } finally {
       setDiagramReady(true);
       setDiagramLoading(false);
@@ -808,6 +1007,59 @@ export function App(): JSX.Element {
   };
 
   useEffect(() => {
+    const checkSession = async (): Promise<void> => {
+      setAuthChecking(true);
+      setAuthError(null);
+      try {
+        const response = await fetch(`${apiBase}/auth/session`);
+        if (!response.ok) {
+          throw new Error(`Session check failed with status ${response.status}`);
+        }
+
+        const payload = (await response.json()) as SessionStatus;
+        const nextAuthenticated = Boolean(payload.authenticated);
+        setAuthenticated(nextAuthenticated);
+        if (nextAuthenticated) {
+          window.localStorage.setItem(authDeviceKey, "1");
+        } else {
+          const hadDeviceSession = window.localStorage.getItem(authDeviceKey) === "1";
+          window.localStorage.removeItem(authDeviceKey);
+          if (hadDeviceSession) {
+            setAuthError("Session expired. Please sign in again.");
+          }
+        }
+      } catch (error) {
+        setAuthenticated(false);
+        window.localStorage.removeItem(authDeviceKey);
+        setAuthError(error instanceof Error ? error.message : "Unable to verify session.");
+      } finally {
+        setAuthChecking(false);
+      }
+    };
+
+    void checkSession();
+  }, []);
+
+  useEffect(() => {
+    const handleUnauthorized = (): void => {
+      window.localStorage.removeItem(authDeviceKey);
+      setAuthenticated(false);
+      setLoading(false);
+      setSecurityModalOpen(false);
+      setAuthError("Session expired or invalid. Please sign in again.");
+    };
+
+    window.addEventListener(unauthorizedEvent, handleUnauthorized);
+    return () => {
+      window.removeEventListener(unauthorizedEvent, handleUnauthorized);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
     const loadAll = async (): Promise<void> => {
       const [
         plantResponse,
@@ -834,12 +1086,45 @@ export function App(): JSX.Element {
           fetch(`${apiBase}/telemetry/stats`),
         ]);
 
-      setPlants((await plantResponse.json()) as PlantRecord[]);
-      setDecision((await dailyResponse.json()) as DailyDecision);
-      setDiscovery((await discoverResponse.json()) as DeviceDiscovery[]);
-      setDeviceProfiles((await profileResponse.json()) as DeviceProfile[]);
-      setRules((await ruleResponse.json()) as AutomationRule[]);
-      setTimeline((await timelineResponse.json()) as AutomationTimelineEvent[]);
+      if (plantResponse.ok) {
+        const payload = (await plantResponse.json()) as unknown;
+        setPlants(Array.isArray(payload) ? (payload as PlantRecord[]) : []);
+      } else {
+        setPlants([]);
+      }
+
+      if (dailyResponse.ok) {
+        setDecision((await dailyResponse.json()) as DailyDecision);
+      }
+
+      if (discoverResponse.ok) {
+        const payload = (await discoverResponse.json()) as unknown;
+        setDiscovery(Array.isArray(payload) ? (payload as DeviceDiscovery[]) : []);
+      } else {
+        setDiscovery([]);
+      }
+
+      if (profileResponse.ok) {
+        const payload = (await profileResponse.json()) as unknown;
+        setDeviceProfiles(Array.isArray(payload) ? (payload as DeviceProfile[]) : []);
+      } else {
+        setDeviceProfiles([]);
+      }
+
+      if (ruleResponse.ok) {
+        const payload = (await ruleResponse.json()) as unknown;
+        setRules(Array.isArray(payload) ? (payload as AutomationRule[]) : []);
+      } else {
+        setRules([]);
+      }
+
+      if (timelineResponse.ok) {
+        const payload = (await timelineResponse.json()) as unknown;
+        setTimeline(Array.isArray(payload) ? (payload as AutomationTimelineEvent[]) : []);
+      } else {
+        setTimeline([]);
+      }
+
       setExpandedTimelineEvents({});
       if (runtimeStatusResponse.ok) {
         setRuntimeStatus(normalizeRuntimeStatus(await runtimeStatusResponse.json()));
@@ -870,11 +1155,15 @@ export function App(): JSX.Element {
     };
 
     void loadAll();
-  }, []);
+  }, [authenticated]);
 
   useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
     void loadDiagramSnapshotFromApi();
-  }, [setDiagramEdges, setDiagramNodes]);
+  }, [authenticated, setDiagramEdges, setDiagramNodes]);
 
   useEffect(() => {
     if (!diagramReady) {
@@ -899,31 +1188,127 @@ export function App(): JSX.Element {
   }, [diagramEdges, diagramNodes, diagramReady]);
 
   useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
     void fetchLatestTelemetrySnapshot();
-  }, []);
+  }, [authenticated]);
 
   const refreshTelemetryPanel = async (): Promise<void> => {
     await Promise.all([fetchLatestTelemetrySnapshot(snapshotPlantIdFilter), fetchTelemetryStats()]);
   };
 
   useEffect(() => {
-    const socket = io(apiBase, { path: "/ws/telemetry" });
+    if (!authenticated) {
+      return;
+    }
+
+    const socket = io(apiBase, { path: "/ws/telemetry", withCredentials: true });
     socket.on("telemetry:update", (point: TelemetryView & { plantId: string }) => {
       setTelemetry((prev) => ({
         ...prev,
         [point.plantId]: {
-          moisture: point.moisture,
-          light: point.light,
-          temperature: point.temperature,
+          ...(point.moisture !== undefined ? { moisture: point.moisture } : {}),
+          ...(point.light !== undefined ? { light: point.light } : {}),
+          ...(point.temperature !== undefined ? { temperature: point.temperature } : {}),
+          ...(point.humidity !== undefined ? { humidity: point.humidity } : {}),
+          ...(point.reservoirLevel !== undefined ? { reservoirLevel: point.reservoirLevel } : {}),
           capturedAt: point.capturedAt,
+          ...(point.sourceProfileId ? { sourceProfileId: point.sourceProfileId } : {}),
+          ...(point.sourceProfileName ? { sourceProfileName: point.sourceProfileName } : {}),
         },
       }));
+      setLastTelemetryEventAt(point.capturedAt);
     });
 
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [authenticated]);
+
+  const submitAuth = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    setAuthSubmitting(true);
+    setAuthError(null);
+
+    try {
+      const response = await fetch(`${apiBase}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passphrase: authPassphrase }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Invalid passphrase");
+      }
+
+      setAuthenticated(true);
+      window.localStorage.setItem(authDeviceKey, "1");
+      setAuthPassphrase("");
+    } catch (error) {
+      setAuthenticated(false);
+      window.localStorage.removeItem(authDeviceKey);
+      setAuthError(error instanceof Error ? error.message : "Unable to sign in.");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const logout = async (): Promise<void> => {
+    await fetch(`${apiBase}/auth/logout`, { method: "POST" });
+    setAuthenticated(false);
+    window.localStorage.removeItem(authDeviceKey);
+    setLoading(false);
+    setAuthPassphrase("");
+    setSecurityModalOpen(false);
+    setCurrentPassphraseDraft("");
+    setNewPassphraseDraft("");
+    setConfirmPassphraseDraft("");
+    setSecurityError(null);
+    setSecuritySuccess(null);
+  };
+
+  const submitPassphraseChange = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    setSecurityError(null);
+    setSecuritySuccess(null);
+
+    if (newPassphraseDraft.trim().length < 12) {
+      setSecurityError("New passphrase must be at least 12 characters.");
+      return;
+    }
+
+    if (newPassphraseDraft !== confirmPassphraseDraft) {
+      setSecurityError("New passphrase and confirmation do not match.");
+      return;
+    }
+
+    setSecuritySaving(true);
+    try {
+      const response = await fetch(`${apiBase}/auth/change-passphrase`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          currentPassphrase: currentPassphraseDraft,
+          newPassphrase: newPassphraseDraft,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Unable to change passphrase. Check your current passphrase.");
+      }
+
+      setCurrentPassphraseDraft("");
+      setNewPassphraseDraft("");
+      setConfirmPassphraseDraft("");
+      setSecuritySuccess("Passphrase updated successfully.");
+    } catch (error) {
+      setSecurityError(error instanceof Error ? error.message : "Unable to change passphrase.");
+    } finally {
+      setSecuritySaving(false);
+    }
+  };
 
   const refreshPlantsAndDecision = async (): Promise<void> => {
     const [plantResponse, dailyResponse] = await Promise.all([
@@ -933,6 +1318,36 @@ export function App(): JSX.Element {
 
     setPlants((await plantResponse.json()) as PlantRecord[]);
     setDecision((await dailyResponse.json()) as DailyDecision);
+  };
+
+  const refreshDeviceProfiles = async (): Promise<void> => {
+    const profileResponse = await fetch(`${apiBase}/devices/profiles`);
+    setDeviceProfiles((await profileResponse.json()) as DeviceProfile[]);
+  };
+
+  const refreshHardwareDiscovery = async (): Promise<void> => {
+    setHardwareDiscoveryLoading(true);
+    setHardwareDiscoveryError(null);
+
+    try {
+      const response = await fetch(`${apiBase}/devices/discover`);
+      if (!response.ok) {
+        throw new Error(`Discovery failed with status ${response.status}`);
+      }
+
+      const payload = (await response.json()) as DeviceDiscovery[];
+      setDiscovery(payload);
+
+      const options = payload.find((entry) => entry.connectionType === deviceType)?.options ?? [];
+      const firstDiscoveredTarget = options[0];
+      if (firstDiscoveredTarget && !options.includes(deviceTarget)) {
+        setDeviceTarget(firstDiscoveredTarget);
+      }
+    } catch (error) {
+      setHardwareDiscoveryError(error instanceof Error ? error.message : "Unable to refresh discovery.");
+    } finally {
+      setHardwareDiscoveryLoading(false);
+    }
   };
 
   const submitPlant = async (event: FormEvent): Promise<void> => {
@@ -1093,28 +1508,9 @@ export function App(): JSX.Element {
     }
   };
 
-  const runSimulation = async (ruleId: string): Promise<void> => {
-    await fetch(`${apiBase}/automation/rules/${ruleId}/simulate`, { method: "POST" });
-  };
-
   const refreshRules = async (): Promise<void> => {
     const response = await fetch(`${apiBase}/automation/rules`);
     setRules((await response.json()) as AutomationRule[]);
-  };
-
-  const toggleRuleEnabled = async (ruleId: string, enabled: boolean): Promise<void> => {
-    setRuleToggleInFlightId(ruleId);
-
-    try {
-      await fetch(`${apiBase}/automation/rules/${ruleId}/enabled`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
-      });
-      await refreshRules();
-    } finally {
-      setRuleToggleInFlightId(null);
-    }
   };
 
   const evaluateAutomation = async (): Promise<void> => {
@@ -1124,97 +1520,262 @@ export function App(): JSX.Element {
     await Promise.all([fetchRuntimeStatus(), fetchRuntimeHistory()]);
   };
 
-  const createDeviceProfile = async (event: FormEvent): Promise<void> => {
+  const saveDeviceProfile = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
-    await fetch(`${apiBase}/devices/profiles`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: deviceName,
-        connectionType: deviceType,
-        transportTarget: deviceTarget,
-        channelMap: {
-          moisture: deviceMoistureChannel,
-          light: deviceLightChannel,
-          temperature: deviceTemperatureChannel,
-        },
-        calibration: {
-          moistureDry: Number(deviceMoistureDry),
-          moistureWet: Number(deviceMoistureWet),
-        },
-        isLive: false,
-      }),
-    });
 
-    const profileResponse = await fetch(`${apiBase}/devices/profiles`);
-    setDeviceProfiles((await profileResponse.json()) as DeviceProfile[]);
-  };
+    const channelAssignments = toChannelAssignmentsPayload(deviceChannelAssignments);
+    const payload = {
+      name: deviceName,
+      connectionType: deviceType,
+      transportTarget: deviceTarget,
+      channelAssignments,
+      ...(deviceEditorProfileId ? {} : { isLive: false }),
+    };
 
-  const updateProfileCalibration = async (
-    id: string,
-    calibration: Record<string, number>,
-    channelMap: Record<string, string>,
-  ): Promise<void> => {
-    await fetch(`${apiBase}/devices/profiles/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ calibration, channelMap }),
-    });
-
-    const profileResponse = await fetch(`${apiBase}/devices/profiles`);
-    setDeviceProfiles((await profileResponse.json()) as DeviceProfile[]);
-  };
-
-  const openProfileEditModal = (profile: DeviceProfile): void => {
-    setProfileEditDraft({
-      id: profile.id,
-      name: profile.name,
-      moistureDry: String(profile.calibration.moistureDry ?? 900),
-      moistureWet: String(profile.calibration.moistureWet ?? 300),
-      moistureChannel: profile.channelMap.moisture ?? "ch0",
-      lightChannel: profile.channelMap.light ?? "ch1",
-      temperatureChannel: profile.channelMap.temperature ?? "ch2",
-    });
-  };
-
-  const saveProfileEdit = async (event: FormEvent): Promise<void> => {
-    event.preventDefault();
-    if (!profileEditDraft) {
-      return;
-    }
-
-    setProfileEditSaving(true);
+    setDeviceEditorSaving(true);
     try {
-      await updateProfileCalibration(
-        profileEditDraft.id,
+      const response = await fetch(
+        deviceEditorProfileId
+          ? `${apiBase}/devices/profiles/${deviceEditorProfileId}`
+          : `${apiBase}/devices/profiles`,
         {
-          moistureDry: Number(profileEditDraft.moistureDry),
-          moistureWet: Number(profileEditDraft.moistureWet),
-        },
-        {
-          moisture: profileEditDraft.moistureChannel,
-          light: profileEditDraft.lightChannel,
-          temperature: profileEditDraft.temperatureChannel,
+          method: deviceEditorProfileId ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
         },
       );
-      setProfileEditDraft(null);
+
+      if (!response.ok) {
+        throw new Error(`Device save failed with status ${response.status}`);
+      }
+
+      await refreshDeviceProfiles();
+      setDeviceEditorOpen(false);
+      setDeviceEditorProfileId(null);
+      setConnectionTest(null);
+      setChannelProbeResult(null);
+      setDetectedChannels([]);
+    } catch (error) {
+      setProfileValidationError(error instanceof Error ? error.message : "Unable to save device profile.");
     } finally {
-      setProfileEditSaving(false);
+      setDeviceEditorSaving(false);
     }
+  };
+
+  const openCreateDeviceEditor = (): void => {
+    setDeviceEditorProfileId(null);
+    setDeviceEditorOpen(true);
+    setDeviceName("Living Room Kit");
+    setDeviceType("serial");
+    setDeviceTarget("COM3");
+    setDeviceChannelAssignments([]);
+    setChannelProbeResult(null);
+    setDetectedChannels([]);
+    setConnectionTest(null);
+    setConnectionSectionOpen(true);
+    setAssignmentSectionOpen(true);
+  };
+
+  const probeDeviceChannels = async (): Promise<void> => {
+    setChannelProbeLoading(true);
+    setChannelProbeError(null);
+    setChannelProbeResult(null);
+    let shouldResumeLive = false;
+
+    try {
+      if (editorProfile?.isLive) {
+        if (deviceEditorProfileId) {
+          const liveChannelResponse = await fetch(`${apiBase}/devices/profiles/${deviceEditorProfileId}/live-channels`);
+          if (liveChannelResponse.ok) {
+            const livePayload = (await liveChannelResponse.json()) as ChannelProbeResult;
+            const liveChannels = Array.isArray(livePayload.channels)
+              ? Array.from(new Set(livePayload.channels.map((channel) => channel.trim()).filter((channel) => channel.length > 0)))
+              : [];
+
+            if (livePayload.ok && liveChannels.length > 0) {
+              setDetectedChannels(liveChannels);
+              setChannelProbeResult({
+                ...livePayload,
+                channels: liveChannels,
+              });
+
+              setDeviceChannelAssignments((prev) => {
+                const next = [...prev];
+                liveChannels.forEach((channel) => {
+                  if (!next.some((entry) => entry.channel === channel)) {
+                    next.push(createAssignmentDraft(channel));
+                  }
+                });
+                return next.filter((entry) => liveChannels.includes(entry.channel));
+              });
+              return;
+            }
+          }
+        }
+
+        if (deviceEditorProfileId) {
+          const pauseResponse = await fetch(`${apiBase}/devices/profiles/${deviceEditorProfileId}/live`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ isLive: false }),
+          });
+
+          if (!pauseResponse.ok) {
+            throw new Error(`Unable to pause live mode for probing (status ${pauseResponse.status}).`);
+          }
+
+          shouldResumeLive = true;
+        }
+      }
+
+      const response = await fetch(
+        `${apiBase}/devices/probe-channels?connectionType=${deviceType}&target=${encodeURIComponent(deviceTarget)}`,
+      );
+
+      if (!response.ok) {
+        throw new Error(`Channel probe failed with status ${response.status}`);
+      }
+
+      const payload = (await response.json()) as ChannelProbeResult;
+      setChannelProbeResult(payload);
+      const channels = Array.isArray(payload.channels) ? payload.channels : [];
+      setDetectedChannels(channels);
+
+      setDeviceChannelAssignments((prev) => {
+        const next = [...prev];
+        channels.forEach((channel) => {
+          if (!next.some((entry) => entry.channel === channel)) {
+            next.push(createAssignmentDraft(channel));
+          }
+        });
+        return next.filter((entry) => channels.includes(entry.channel));
+      });
+    } catch (error) {
+      setChannelProbeError(error instanceof Error ? error.message : "Unable to probe channels.");
+    } finally {
+      if (shouldResumeLive && deviceEditorProfileId) {
+        try {
+          const resumeResponse = await fetch(`${apiBase}/devices/profiles/${deviceEditorProfileId}/live`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ isLive: true }),
+          });
+
+          if (!resumeResponse.ok) {
+            setChannelProbeError((prev) =>
+              prev
+                ? `${prev} Also failed to resume live mode (status ${resumeResponse.status}).`
+                : `Probe completed, but failed to resume live mode (status ${resumeResponse.status}).`,
+            );
+          }
+        } catch {
+          setChannelProbeError((prev) =>
+            prev
+              ? `${prev} Also failed to resume live mode.`
+              : "Probe completed, but failed to resume live mode.",
+          );
+        }
+
+        await refreshDeviceProfiles();
+      }
+
+      setChannelProbeLoading(false);
+    }
+  };
+
+  const openEditDeviceEditor = (profile: DeviceProfile): void => {
+    setDeviceEditorProfileId(profile.id);
+    setDeviceEditorOpen(true);
+    setDeviceName(profile.name);
+    setDeviceType(profile.connectionType);
+    setDeviceTarget(profile.transportTarget);
+    setDeviceChannelAssignments((profile.channelAssignments ?? []).map((assignment) => toAssignmentDraft(assignment)));
+    setDetectedChannels(
+      Array.from(new Set((profile.channelAssignments ?? []).map((assignment) => assignment.channel))),
+    );
+    setChannelProbeResult(null);
+    setConnectionTest(null);
+    setConnectionSectionOpen(true);
+    setAssignmentSectionOpen(true);
   };
 
   const testDeviceConnection = async (): Promise<void> => {
+    if (editorProfile?.isLive) {
+      setConnectionTest({
+        ok: true,
+        latencyMs: 0,
+        message: "Live mode is currently running for this profile. Connection is healthy.",
+      });
+      return;
+    }
+
     const response = await fetch(
       `${apiBase}/devices/test?connectionType=${deviceType}&target=${encodeURIComponent(deviceTarget)}`,
     );
     setConnectionTest((await response.json()) as ConnectionTestResult);
   };
 
-  const simulateProfile = async (id: string): Promise<void> => {
-    await fetch(`${apiBase}/devices/profiles/${id}/simulate`, { method: "POST" });
+  const testSavedProfileConnection = async (profile: DeviceProfile): Promise<void> => {
+    setProfileTestInFlightId(profile.id);
+    try {
+      const response = await fetch(
+        `${apiBase}/devices/test?connectionType=${profile.connectionType}&target=${encodeURIComponent(profile.transportTarget)}`,
+      );
+      const result = (await response.json()) as ConnectionTestResult;
+      setProfileConnectionTests((prev) => ({
+        ...prev,
+        [profile.id]: result,
+      }));
+    } finally {
+      setProfileTestInFlightId(null);
+    }
   };
 
-  const validateProfile = async (id: string): Promise<void> => {
+  const deleteProfile = async (id: string): Promise<void> => {
+    setProfileDeleteInFlightId(id);
+    try {
+      await fetch(`${apiBase}/devices/profiles/${id}`, { method: "DELETE" });
+      setProfileValidation((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setProfileConnectionTests((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      await refreshDeviceProfiles();
+    } finally {
+      setProfileDeleteInFlightId(null);
+    }
+  };
+
+  const clearAllProfiles = async (): Promise<void> => {
+    const hasProfiles = deviceProfiles.length > 0;
+    if (!hasProfiles) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete all ${deviceProfiles.length} hardware profile(s)? This cannot be undone.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingAllProfiles(true);
+    try {
+      await fetch(`${apiBase}/devices/profiles`, { method: "DELETE" });
+      setProfileValidation({});
+      setProfileConnectionTests({});
+      await refreshDeviceProfiles();
+    } finally {
+      setDeletingAllProfiles(false);
+    }
+  };
+
+  const validateProfile = async (id: string): Promise<DeviceProfileValidationResult | null> => {
     setProfileValidationInFlightId(id);
     setProfileValidationError(null);
     try {
@@ -1228,14 +1789,24 @@ export function App(): JSX.Element {
         ...prev,
         [id]: payload,
       }));
+      return payload;
     } catch (error) {
       setProfileValidationError(error instanceof Error ? error.message : "Unable to validate profile.");
+      return null;
     } finally {
       setProfileValidationInFlightId(null);
     }
   };
 
   const toggleLiveMode = async (id: string, isLive: boolean): Promise<void> => {
+    if (isLive && !profileValidation[id]) {
+      const validation = await validateProfile(id);
+      if (!validation || !validation.ok) {
+        setProfileValidationError("Cannot enable live mode until validation passes.");
+        return;
+      }
+    }
+
     const response = await fetch(`${apiBase}/devices/profiles/${id}/live`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -1258,26 +1829,7 @@ export function App(): JSX.Element {
       return;
     }
 
-    const profileResponse = await fetch(`${apiBase}/devices/profiles`);
-    setDeviceProfiles((await profileResponse.json()) as DeviceProfile[]);
-  };
-
-  const createRule = async (event: FormEvent): Promise<void> => {
-    event.preventDefault();
-    await fetch(`${apiBase}/automation/rules`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: ruleName,
-        enabled: true,
-        condition: { metric: "moisture", operator: "<", value: 35 },
-        action: { target: "pump", seconds: 8 },
-        safety: { cooldownMinutes: 60, maxDailyRuntimeSeconds: 90 },
-      }),
-    });
-
-    await refreshRules();
-    setIsRuleModalOpen(false);
+    await refreshDeviceProfiles();
   };
 
   const applyTimelineFilters = async (event: FormEvent): Promise<void> => {
@@ -1309,13 +1861,18 @@ export function App(): JSX.Element {
     void fetchTimeline(nextFilters);
   };
 
-  const jumpToPanel = (panel: "plants" | "devices" | "automation" | "diagrams"): void => {
+  const jumpToPanel = (panel: "plants" | "devices" | "logs" | "flows"): void => {
     setActivePanel(panel);
     setQuickActionsOpen(false);
   };
 
   const onDiagramConnect = useCallback(
     (connection: Connection) => {
+      if (flowLiveMode) {
+        setDiagramConnectionError("Flow is live and locked. Unlock to edit connections.");
+        return;
+      }
+
       const sourceNode = diagramNodes.find((node: Node<DiagramNodeData>) => node.id === connection.source);
       const targetNode = diagramNodes.find((node: Node<DiagramNodeData>) => node.id === connection.target);
       const sourceKind = sourceNode?.data.kind ?? "trigger";
@@ -1366,14 +1923,18 @@ export function App(): JSX.Element {
         ),
       );
     },
-    [diagramEdges, diagramNodes, setDiagramEdges],
+    [diagramEdges, diagramNodes, flowLiveMode, setDiagramEdges],
   );
 
   const addDiagramNode = (): void => {
+    if (flowLiveMode) {
+      return;
+    }
+
     const id = `node-${Date.now()}`;
     const defaultsByKind: Record<DiagramNodeKind, DiagramNodeData> = {
-      trigger: { label: "Plant Trigger", kind: "trigger", plantId: "" },
-      condition: { label: "Condition", kind: "condition", metric: "moisture", operator: "<", value: 35 },
+      trigger: { label: "Plant Trigger", kind: "trigger", plantId: "", metric: "moisture", operator: "<", value: 35 },
+      condition: { label: "Condition", kind: "condition", plantId: "", metric: "moisture", operator: "<", value: 35 },
       action: {
         label: "Action",
         kind: "action",
@@ -1403,6 +1964,10 @@ export function App(): JSX.Element {
   };
 
   const insertStarterAutomationFlow = (): void => {
+    if (flowLiveMode) {
+      return;
+    }
+
     setDiagramNodes(defaultDiagramNodes);
     setDiagramEdges(defaultDiagramEdges);
     setSelectedDiagramNodeId("condition");
@@ -1426,6 +1991,7 @@ export function App(): JSX.Element {
       const compiledCount = Number(payload.compiledRuleCount ?? 0);
       setDiagramPreviewIssues(Array.isArray(payload.issues) ? payload.issues : []);
       setDiagramApplyResult(`Applied flow successfully. ${compiledCount} rule(s) compiled.`);
+      setFlowLiveMode(true);
       await Promise.all([
         refreshRules(),
         fetchTimeline(timelineFilters),
@@ -1439,29 +2005,11 @@ export function App(): JSX.Element {
     }
   };
 
-  const previewDiagramFlow = async (): Promise<void> => {
-    setDiagramPreviewInFlight(true);
-    setDiagramApplyError(null);
-    setDiagramPreviewResult(null);
-
-    try {
-      const response = await fetch(`${apiBase}/automation/diagram-scopes/dashboard/preview`);
-      if (!response.ok) {
-        throw new Error(`Preview flow failed with status ${response.status}`);
-      }
-
-      const payload = (await response.json()) as DiagramPreviewResponse;
-      const compiledCount = Number(payload.compiledRuleCount ?? 0);
-      setDiagramPreviewIssues(Array.isArray(payload.issues) ? payload.issues : []);
-      setDiagramPreviewResult(`Preview complete. ${compiledCount} rule(s) ready to apply.`);
-    } catch (error) {
-      setDiagramApplyError(error instanceof Error ? error.message : "Unable to preview flow.");
-    } finally {
-      setDiagramPreviewInFlight(false);
-    }
-  };
-
   const removeSelectedDiagramNode = (): void => {
+    if (flowLiveMode) {
+      return;
+    }
+
     if (!selectedDiagramNodeId) {
       return;
     }
@@ -1473,6 +2021,52 @@ export function App(): JSX.Element {
 
   const enabledRuleCount = rules.filter((rule) => rule.enabled).length;
   const liveProfileCount = deviceProfiles.filter((profile) => profile.isLive).length;
+  const selectedDiscoveryOptions =
+    discovery.find((entry) => entry.connectionType === deviceType)?.options ?? [];
+  const conflictingTargets = useMemo(() => {
+    const activeEditorId = deviceEditorProfileId;
+    return new Set(
+      deviceProfiles
+        .filter(
+          (profile) =>
+            profile.connectionType === deviceType &&
+            profile.id !== activeEditorId &&
+            profile.transportTarget.trim().length > 0,
+        )
+        .map((profile) => profile.transportTarget.trim().toLowerCase()),
+    );
+  }, [deviceEditorProfileId, deviceProfiles, deviceType]);
+  const hasTargetConflict = conflictingTargets.has(deviceTarget.trim().toLowerCase());
+  const liveTelemetryRows = useMemo(() => {
+    return Object.entries(telemetry)
+      .map(([plantId, point]) => ({
+        plantId,
+        plantName: plantLookup.get(plantId) ?? "Unmapped Plant",
+        point,
+        sourceProfile: point.sourceProfileId ? profileLookup.get(point.sourceProfileId) : undefined,
+      }))
+      .sort((a, b) => Date.parse(b.point.capturedAt) - Date.parse(a.point.capturedAt));
+  }, [plantLookup, profileLookup, telemetry]);
+  const isTelemetryStreamActive =
+    lastTelemetryEventAt !== null && Date.now() - Date.parse(lastTelemetryEventAt) < 20_000;
+  const editorProfile = useMemo(
+    () => deviceProfiles.find((profile) => profile.id === deviceEditorProfileId) ?? null,
+    [deviceEditorProfileId, deviceProfiles],
+  );
+
+  const changeDeviceType = (nextType: DeviceProfile["connectionType"]): void => {
+    setDeviceType(nextType);
+    setConnectionTest(null);
+    setDetectedChannels([]);
+    setChannelProbeResult(null);
+    setChannelProbeError(null);
+    setDeviceChannelAssignments([]);
+    setConnectionTest(null);
+
+    const detectedTargets = discovery.find((entry) => entry.connectionType === nextType)?.options ?? [];
+    setDeviceTarget(detectedTargets[0] ?? defaultTargetByConnectionType[nextType]);
+  };
+
   const heroPlants = useMemo(() => {
     const dueIds = new Set(decision?.duePlantIds ?? []);
     const overdueIds = new Set(decision?.overduePlantIds ?? []);
@@ -1491,6 +2085,41 @@ export function App(): JSX.Element {
       .map((entry) => entry.plant);
   }, [decision, plants]);
 
+  if (authChecking) {
+    return (
+      <main className="app-shell dashboard-shell">
+        <section className="panel" style={{ maxWidth: "480px", margin: "3rem auto" }}>
+          <h2>Checking session...</h2>
+        </section>
+      </main>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <main className="app-shell dashboard-shell">
+        <section className="panel" style={{ maxWidth: "480px", margin: "3rem auto" }}>
+          <h2>Sign In</h2>
+          <p className="muted">Enter your passphrase to unlock the control center.</p>
+          {authError ? <p className="muted">Auth error: {authError}</p> : null}
+          <form className="plant-form" onSubmit={(event) => void submitAuth(event)}>
+            <input
+              type="password"
+              value={authPassphrase}
+              onChange={(event) => setAuthPassphrase(event.target.value)}
+              placeholder="Passphrase"
+              autoComplete="current-password"
+              required
+            />
+            <button type="submit" disabled={authSubmitting}>
+              {authSubmitting ? "Signing in..." : "Sign In"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell dashboard-shell">
       <header className="app-header panel">
@@ -1500,11 +2129,25 @@ export function App(): JSX.Element {
           <p className="muted">Daily care, telemetry, hardware, and automation in one dashboard.</p>
         </div>
         <div className="header-actions">
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => {
+              setSecurityModalOpen(true);
+              setSecurityError(null);
+              setSecuritySuccess(null);
+            }}
+          >
+            Security
+          </button>
+          <button type="button" className="ghost-button" onClick={() => void logout()}>
+            Sign Out
+          </button>
           <button type="button" className="ghost-button" onClick={() => setIsPlantModalOpen(true)}>
             Add Plant
           </button>
-          <button type="button" className="accent-button" onClick={() => setIsRuleModalOpen(true)}>
-            Create Rule
+          <button type="button" className="accent-button" onClick={() => setActivePanel("flows")}>
+            Open Flows
           </button>
         </div>
       </header>
@@ -1523,7 +2166,7 @@ export function App(): JSX.Element {
           <strong>{liveProfileCount}</strong>
         </article>
         <article className="summary-card">
-          <p>Enabled Rules</p>
+          <p>Applied Flow Rules</p>
           <strong>{enabledRuleCount}</strong>
         </article>
       </section>
@@ -1540,6 +2183,7 @@ export function App(): JSX.Element {
             const isOverdue = Boolean(decision?.overduePlantIds.includes(plant.id));
             const isDue = Boolean(decision?.duePlantIds.includes(plant.id));
             const statusLabel = isOverdue ? "Overdue" : isDue ? "Due Today" : "On Track";
+            const latestTelemetry = telemetry[plant.id];
 
             return (
               <li key={plant.id} className="hero-plant-card">
@@ -1557,6 +2201,11 @@ export function App(): JSX.Element {
                   </div>
                   <p className="muted">
                     {plant.species} in {plant.zone}
+                  </p>
+                  <p className="muted">
+                    {latestTelemetry
+                      ? `Moisture ${formatMeasurement(latestTelemetry.moisture, "%")} | Light ${formatMeasurement(latestTelemetry.light)} | Temp ${formatMeasurement(latestTelemetry.temperature, "C")}`
+                      : "No telemetry yet"}
                   </p>
                   <div className="actions">
                     <button type="button" onClick={() => void markWatered(plant.id)}>
@@ -1609,11 +2258,11 @@ export function App(): JSX.Element {
             <button type="button" className="ghost-button" onClick={() => jumpToPanel("devices")}>
               Jump to Devices
             </button>
-            <button type="button" className="ghost-button" onClick={() => jumpToPanel("automation")}>
-              Jump to Automation
+            <button type="button" className="ghost-button" onClick={() => jumpToPanel("logs")}>
+              Jump to Logs
             </button>
-            <button type="button" className="ghost-button" onClick={() => jumpToPanel("diagrams")}>
-              Jump to Diagrams
+            <button type="button" className="ghost-button" onClick={() => jumpToPanel("flows")}>
+              Jump to Flows
             </button>
           </div>
         </div>
@@ -1694,20 +2343,20 @@ export function App(): JSX.Element {
         <button
           type="button"
           role="tab"
-          aria-selected={activePanel === "automation"}
-          className={`tab-chip ${activePanel === "automation" ? "active" : ""}`}
-          onClick={() => setActivePanel("automation")}
+          aria-selected={activePanel === "logs"}
+          className={`tab-chip ${activePanel === "logs" ? "active" : ""}`}
+          onClick={() => setActivePanel("logs")}
         >
-          Timeline + Rules
+          Logs
         </button>
         <button
           type="button"
           role="tab"
-          aria-selected={activePanel === "diagrams"}
-          className={`tab-chip ${activePanel === "diagrams" ? "active" : ""}`}
-          onClick={() => setActivePanel("diagrams")}
+          aria-selected={activePanel === "flows"}
+          className={`tab-chip ${activePanel === "flows" ? "active" : ""}`}
+          onClick={() => setActivePanel("flows")}
         >
-          Diagrams
+          Flows
         </button>
       </section>
 
@@ -1883,7 +2532,8 @@ export function App(): JSX.Element {
                       const latestTelemetry = telemetry[plant.id];
                       return latestTelemetry ? (
                         <p className="muted">
-                          Latest telemetry: Moisture {latestTelemetry.moisture}% | Temp {latestTelemetry.temperature}C
+                          Latest telemetry: Moisture {formatMeasurement(latestTelemetry.moisture, "%")} | Light{" "}
+                          {formatMeasurement(latestTelemetry.light)} | Temp {formatMeasurement(latestTelemetry.temperature, "C")}
                         </p>
                       ) : (
                         <p className="muted">No telemetry yet</p>
@@ -1922,18 +2572,18 @@ export function App(): JSX.Element {
         </section>
       ) : null}
 
-      {activePanel === "diagrams" ? (
-        <section className="panel diagram-panel">
+      {activePanel === "flows" ? (
+        <section className={`panel diagram-panel ${flowLiveMode ? "flow-live" : ""}`}>
           <div className="panel-header">
-            <h2>Editable Diagrams</h2>
+            <h2>Automation Flows</h2>
           </div>
-          <p className="muted">Drag nodes, connect handles, and edit fields directly in the nodes. Changes sync automatically.</p>
+          <p className="muted">Build trigger to condition to action flows. Apply starts live mode and locks editing until unlocked.</p>
           <p className="muted">
             {diagramSaving ? "Saving diagram..." : "Diagram sync idle."}
             {diagramLastSavedAt ? ` Last saved ${new Date(diagramLastSavedAt).toLocaleString()}.` : ""}
             {diagramSyncError ? ` Sync error: ${diagramSyncError}` : ""}
           </p>
-          {diagramPreviewResult ? <p className="muted">{diagramPreviewResult}</p> : null}
+          {flowLiveMode ? <p className="muted">Flow is live. Editing is locked while live mode is active.</p> : null}
           {diagramApplyResult ? <p className="muted">{diagramApplyResult}</p> : null}
           {diagramApplyError ? <p className="muted">Flow apply error: {diagramApplyError}</p> : null}
           {diagramConnectionError ? <p className="muted">Flow editor warning: {diagramConnectionError}</p> : null}
@@ -1953,29 +2603,29 @@ export function App(): JSX.Element {
               <button type="button" className="icon-button" title="Reload" onClick={() => void loadDiagramSnapshotFromApi()} disabled={diagramLoading}>
                 {diagramLoading ? "..." : "↻"}
               </button>
+              <button
+                type="button"
+                className="icon-button"
+                title="Toggle edit lock"
+                onClick={() => setFlowLiveMode((prev) => !prev)}
+              >
+                {flowLiveMode ? "🔒" : "🔓"}
+              </button>
               <select
                 value={diagramNodeKindDraft}
                 onChange={(event) => setDiagramNodeKindDraft(event.target.value as DiagramNodeKind)}
                 aria-label="New node type"
+                disabled={flowLiveMode}
               >
                 <option value="trigger">Trigger</option>
                 <option value="condition">Condition</option>
                 <option value="action">Action</option>
               </select>
-              <button type="button" className="icon-button" title="Add node" onClick={addDiagramNode}>
+              <button type="button" className="icon-button" title="Add node" onClick={addDiagramNode} disabled={flowLiveMode}>
                 +
               </button>
-              <button type="button" className="icon-button" title="Starter flow" onClick={insertStarterAutomationFlow}>
+              <button type="button" className="icon-button" title="Starter flow" onClick={insertStarterAutomationFlow} disabled={flowLiveMode}>
                 ⚡
-              </button>
-              <button
-                type="button"
-                className="icon-button"
-                title="Preview flow"
-                onClick={() => void previewDiagramFlow()}
-                disabled={diagramPreviewInFlight}
-              >
-                {diagramPreviewInFlight ? "..." : "👁"}
               </button>
               <button
                 type="button"
@@ -1991,7 +2641,7 @@ export function App(): JSX.Element {
                 className="icon-button danger"
                 title="Delete selected"
                 onClick={removeSelectedDiagramNode}
-                disabled={!selectedDiagramNodeId}
+                disabled={!selectedDiagramNodeId || flowLiveMode}
               >
                 ⌫
               </button>
@@ -1999,7 +2649,7 @@ export function App(): JSX.Element {
             {diagramReady ? (
               <ReactFlow
                 nodes={diagramNodesForCanvas}
-                edges={diagramEdges}
+                edges={diagramEdgesForCanvas}
                 nodeTypes={flowNodeTypes}
                 defaultEdgeOptions={{
                   type: "smoothstep",
@@ -2010,8 +2660,8 @@ export function App(): JSX.Element {
                   },
                 }}
                 connectionLineType={ConnectionLineType.SmoothStep}
-                onNodesChange={onDiagramNodesChange}
-                onEdgesChange={onDiagramEdgesChange}
+                onNodesChange={flowLiveMode ? () => undefined : onDiagramNodesChange}
+                onEdgesChange={flowLiveMode ? () => undefined : onDiagramEdgesChange}
                 onConnect={onDiagramConnect}
                 onNodeClick={(_event: unknown, node: Node<DiagramNodeData>) => {
                   setSelectedDiagramNodeId(node.id);
@@ -2019,6 +2669,9 @@ export function App(): JSX.Element {
                 onPaneClick={() => {
                   setSelectedDiagramNodeId(null);
                 }}
+                nodesDraggable={!flowLiveMode}
+                nodesConnectable={!flowLiveMode}
+                elementsSelectable={!flowLiveMode}
                 fitView
               >
                 <Controls />
@@ -2034,70 +2687,384 @@ export function App(): JSX.Element {
           <section className="panel">
             <div className="panel-header">
               <h2>Hardware Setup</h2>
-            </div>
-            <p className="muted">Manage saved profiles first, then open advanced setup to add or calibrate hardware.</p>
-            <details className="advanced-panel">
-              <summary>Advanced device setup</summary>
-              <form className="inline-form" onSubmit={(event) => void createDeviceProfile(event)}>
-                <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} aria-label="Device name" />
-                <select
-                  value={deviceType}
-                  onChange={(event) => setDeviceType(event.target.value as "serial" | "network" | "bluetooth")}
-                  aria-label="Device connection type"
+              <div className="panel-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => void refreshHardwareDiscovery()}
+                  disabled={hardwareDiscoveryLoading}
                 >
-                  <option value="serial">serial</option>
-                  <option value="network">network</option>
-                  <option value="bluetooth">bluetooth</option>
-                </select>
-                <input value={deviceTarget} onChange={(event) => setDeviceTarget(event.target.value)} aria-label="Device target" />
-                <input
-                  value={deviceMoistureChannel}
-                  onChange={(event) => setDeviceMoistureChannel(event.target.value)}
-                  placeholder="moisture channel"
-                />
-                <input
-                  value={deviceLightChannel}
-                  onChange={(event) => setDeviceLightChannel(event.target.value)}
-                  placeholder="light channel"
-                />
-                <input
-                  value={deviceTemperatureChannel}
-                  onChange={(event) => setDeviceTemperatureChannel(event.target.value)}
-                  placeholder="temperature channel"
-                />
-                <input
-                  value={deviceMoistureDry}
-                  onChange={(event) => setDeviceMoistureDry(event.target.value)}
-                  placeholder="moisture dry"
-                />
-                <input
-                  value={deviceMoistureWet}
-                  onChange={(event) => setDeviceMoistureWet(event.target.value)}
-                  placeholder="moisture wet"
-                />
-                <button type="submit">Save Profile</button>
+                  {hardwareDiscoveryLoading ? "Refreshing..." : "Refresh Discovery"}
+                </button>
+              </div>
+            </div>
+            <p className="muted">
+              Create real hardware profiles, validate connectivity, and monitor live telemetry updates in one place.
+            </p>
+            {hardwareDiscoveryError ? <p className="muted">Discovery error: {hardwareDiscoveryError}</p> : null}
+
+            <div className="hardware-status-grid">
+              <article>
+                <h3>Saved Profiles</h3>
+                <p>{deviceProfiles.length}</p>
+              </article>
+              <article>
+                <h3>Live Profiles</h3>
+                <p>{liveProfileCount}</p>
+              </article>
+              <article>
+                <h3>Detected Targets</h3>
+                <p>{discovery.reduce((total, entry) => total + entry.options.length, 0)}</p>
+              </article>
+              <article>
+                <h3>Telemetry Stream</h3>
+                <p>{isTelemetryStreamActive ? "active" : "waiting"}</p>
+              </article>
+            </div>
+
+            <div className="panel-actions">
+              {!deviceEditorOpen ? (
+                <button type="button" className="accent-button" onClick={openCreateDeviceEditor}>
+                  Create New Profile
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => {
+                    setDeviceEditorOpen(false);
+                    setDeviceEditorProfileId(null);
+                    setConnectionTest(null);
+                  }}
+                >
+                  Close Editor
+                </button>
+              )}
+            </div>
+
+            {deviceEditorOpen ? (
+              <>
+              <form className="hardware-setup-form" onSubmit={(event) => void saveDeviceProfile(event)}>
+                <div className="hardware-form-section">
+                  <button
+                    type="button"
+                    className="hardware-section-toggle"
+                    onClick={() => setConnectionSectionOpen((prev) => !prev)}
+                    aria-expanded={connectionSectionOpen}
+                  >
+                    <h3>Connection</h3>
+                    <span>{connectionSectionOpen ? "Hide" : "Show"}</span>
+                  </button>
+                  {connectionSectionOpen ? (
+                  <div className="hardware-form-grid">
+                    <div className="hardware-field">
+                      <label htmlFor="device-name-input">Profile Name</label>
+                      <input
+                        id="device-name-input"
+                        value={deviceName}
+                        onChange={(event) => setDeviceName(event.target.value)}
+                        aria-label="Device name"
+                      />
+                      <small className="field-hint">Shown in saved profiles for quick identification.</small>
+                    </div>
+
+                    <div className="hardware-field">
+                      <label htmlFor="device-connection-type-select">Connection Type</label>
+                      <select
+                        id="device-connection-type-select"
+                        value={deviceType}
+                        onChange={(event) => changeDeviceType(event.target.value as DeviceProfile["connectionType"])}
+                        aria-label="Device connection type"
+                      >
+                        <option value="serial">Serial (COM)</option>
+                        <option value="network">Network (IP:Port)</option>
+                        <option value="bluetooth">Bluetooth</option>
+                      </select>
+                      <small className="field-hint">Select the transport used by your hardware bridge.</small>
+                    </div>
+
+                    <div className="hardware-field hardware-field-wide">
+                      <label htmlFor="device-target-input">Connection Target</label>
+                      <input
+                        id="device-target-input"
+                        value={deviceTarget}
+                        onChange={(event) => setDeviceTarget(event.target.value)}
+                        aria-label="Device target"
+                        placeholder={defaultTargetByConnectionType[deviceType]}
+                        list="device-target-options"
+                      />
+                      <datalist id="device-target-options">
+                        {selectedDiscoveryOptions.map((option) => (
+                          <option key={`${deviceType}-${option}`} value={option} />
+                        ))}
+                      </datalist>
+                      <small className="field-hint">
+                        {connectionTargetHint[deviceType]} {selectedDiscoveryOptions.length > 0 ? "Suggestions available from discovery." : "Run discovery and use one of the detected targets below."}
+                      </small>
+                      {selectedDiscoveryOptions.length > 0 ? (
+                        <div className="target-option-chips" role="group" aria-label="Detected hardware targets">
+                          {selectedDiscoveryOptions.map((option) => (
+                            <button
+                              key={`target-chip-${deviceType}-${option}`}
+                              type="button"
+                              className={`target-chip ${option === deviceTarget ? "active" : ""} ${conflictingTargets.has(option.trim().toLowerCase()) ? "conflict" : ""}`}
+                              onClick={() => {
+                                if (conflictingTargets.has(option.trim().toLowerCase())) {
+                                  return;
+                                }
+                                setDeviceTarget(option);
+                              }}
+                              disabled={conflictingTargets.has(option.trim().toLowerCase())}
+                            >
+                              {option}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                      {hasTargetConflict ? (
+                        <small className="connection-test-result failed">
+                          Target conflict: another profile already uses this target.
+                        </small>
+                      ) : null}
+                    </div>
+                  </div>
+                  ) : null}
+                </div>
+
+                <div className="hardware-form-section">
+                  <button
+                    type="button"
+                    className="hardware-section-toggle"
+                    onClick={() => setAssignmentSectionOpen((prev) => !prev)}
+                    aria-expanded={assignmentSectionOpen}
+                  >
+                    <h3>Probe and Assign Channels</h3>
+                    <span>{assignmentSectionOpen ? "Hide" : "Show"}</span>
+                  </button>
+                  {assignmentSectionOpen ? (
+                    <>
+                      <div className="panel-header">
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() => void probeDeviceChannels()}
+                          disabled={channelProbeLoading}
+                        >
+                          {channelProbeLoading ? "Probing..." : "Probe Channels"}
+                        </button>
+                      </div>
+                      <p className="muted">
+                        Connect first, probe live payload channels, then assign each channel to a plant and measurement.
+                      </p>
+                      {channelProbeError ? <p className="muted">Probe error: {channelProbeError}</p> : null}
+                      {channelProbeResult ? (
+                        <p className="muted">
+                          {channelProbeResult.ok ? "Probe succeeded" : "Probe returned no channels"}: {channelProbeResult.message}
+                        </p>
+                      ) : null}
+                      <p className="muted">Detected channels: {detectedChannels.length}</p>
+
+                      {deviceChannelAssignments.length === 0 ? (
+                        <p className="muted">No channels detected yet. Click Probe Channels to load assignments.</p>
+                      ) : (
+                        <div className="hardware-channel-assignment-list">
+                          {deviceChannelAssignments.map((assignment, index) => (
+                            <div className="hardware-form-grid" key={`assignment-${assignment.channel}-${index}`}>
+                          <div className="hardware-field">
+                            <label>Channel</label>
+                            <input value={assignment.channel} readOnly />
+                          </div>
+                          <div className="hardware-field">
+                            <label>Plant</label>
+                            <select
+                              value={assignment.plantId}
+                              onChange={(event) =>
+                                setDeviceChannelAssignments((prev) =>
+                                  prev.map((entry, entryIndex) =>
+                                    entryIndex === index
+                                      ? {
+                                          ...entry,
+                                          plantId: event.target.value,
+                                        }
+                                      : entry,
+                                  ),
+                                )
+                              }
+                            >
+                              <option value="">Select plant</option>
+                              {plants.map((plant) => (
+                                <option key={`assignment-plant-${plant.id}`} value={plant.id}>
+                                  {plant.nickname} ({plant.zone})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="hardware-field">
+                            <label>Measurement Type</label>
+                            <select
+                              value={assignment.measurementType}
+                              onChange={(event) =>
+                                setDeviceChannelAssignments((prev) =>
+                                  prev.map((entry, entryIndex) =>
+                                    entryIndex === index
+                                      ? {
+                                          ...entry,
+                                          measurementType: event.target.value as DeviceMeasurementType,
+                                        }
+                                      : entry,
+                                  ),
+                                )
+                              }
+                            >
+                              {measurementTypeOptions.map((option) => (
+                                <option key={`assignment-type-${assignment.channel}-${option}`} value={option}>
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {assignment.measurementType === "moisture" ? (
+                            <>
+                              <div className="hardware-field">
+                                <label>Input Min</label>
+                                <input
+                                  value={assignment.inputMin}
+                                  placeholder="300"
+                                  onChange={(event) =>
+                                    setDeviceChannelAssignments((prev) =>
+                                      prev.map((entry, entryIndex) =>
+                                        entryIndex === index
+                                          ? {
+                                              ...entry,
+                                              inputMin: event.target.value,
+                                            }
+                                          : entry,
+                                      ),
+                                    )
+                                  }
+                                />
+                              </div>
+                              <div className="hardware-field">
+                                <label>Input Max</label>
+                                <input
+                                  value={assignment.inputMax}
+                                  placeholder="900"
+                                  onChange={(event) =>
+                                    setDeviceChannelAssignments((prev) =>
+                                      prev.map((entry, entryIndex) =>
+                                        entryIndex === index
+                                          ? {
+                                              ...entry,
+                                              inputMax: event.target.value,
+                                            }
+                                          : entry,
+                                      ),
+                                    )
+                                  }
+                                />
+                                <small className="field-hint">
+                                  Values map to 0-100 using (max - raw) / (max - min).
+                                </small>
+                              </div>
+                            </>
+                          ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  ) : null}
+                </div>
+
+                <div className="inline-actions hardware-actions">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => void testDeviceConnection()}
+                    disabled={hasTargetConflict}
+                  >
+                    Test Connection
+                  </button>
+                  <button type="submit" className="accent-button" disabled={hasTargetConflict || deviceEditorSaving}>
+                    {deviceEditorSaving
+                      ? "Saving..."
+                      : deviceEditorProfileId
+                        ? "Save Profile Changes"
+                        : "Save Profile"}
+                  </button>
+                </div>
               </form>
               <div className="inline-actions">
-                <button onClick={() => void testDeviceConnection()}>Test Connection</button>
                 {connectionTest ? (
-                  <small>
+                  <small className={`connection-test-result ${connectionTest.ok ? "ok" : "failed"}`}>
                     {connectionTest.ok ? "ok" : "failed"} {connectionTest.latencyMs}ms - {connectionTest.message}
                   </small>
                 ) : null}
               </div>
-              <ul className="simple-list">
-                {discovery.map((entry) => (
-                  <li key={entry.connectionType} className="compact-card">
-                    <strong>{entry.connectionType}</strong>: {entry.options.join(", ")}
-                  </li>
-                ))}
-              </ul>
-            </details>
+              </>
+            ) : null}
+
+            <div className="hardware-live-stream panel-subsection">
+              <div className="panel-header">
+                <h3>Live Telemetry Stream</h3>
+                <small className={isTelemetryStreamActive ? "stream-state-good" : "stream-state-waiting"}>
+                  {isTelemetryStreamActive ? "Receiving updates" : "No recent update"}
+                </small>
+              </div>
+              {lastTelemetryEventAt ? (
+                <p className="muted">Last event: {new Date(lastTelemetryEventAt).toLocaleString()}</p>
+              ) : (
+                <p className="muted">No telemetry stream events have arrived yet.</p>
+              )}
+
+              {liveTelemetryRows.length === 0 ? (
+                <p className="muted">Waiting for hardware telemetry. Once connected, values will appear here in real time.</p>
+              ) : (
+                <ul className="simple-list hardware-telemetry-list">
+                  {liveTelemetryRows.map((entry) => (
+                    <li key={`stream-${entry.plantId}`} className="compact-card">
+                      <div className="profile-head">
+                        <strong>{entry.plantName}</strong>
+                        <span className="state-pill">{entry.plantId.slice(0, 8)}</span>
+                      </div>
+                      <p className="muted">
+                        Moisture {formatMeasurement(entry.point.moisture, "%")} | Light{" "}
+                        {formatMeasurement(entry.point.light)} | Temp {formatMeasurement(entry.point.temperature, "C")} | Humidity{" "}
+                        {formatMeasurement(entry.point.humidity, "%")} | Reservoir {formatMeasurement(entry.point.reservoirLevel, "%")}
+                      </p>
+                      <p className="muted">
+                        Source profile: {entry.point.sourceProfileName ?? entry.point.sourceProfileId ?? "Direct ingest"}
+                      </p>
+                      {entry.sourceProfile ? (
+                        <p className="muted">
+                          Mapped labels: {entry.sourceProfile.channelAssignments
+                            .filter((assignment) => assignment.plantId === entry.plantId)
+                            .map((assignment) => `${assignment.measurementType}=${assignment.channel}`)
+                            .join(", ") || "none"}
+                        </p>
+                      ) : null}
+                      <p className="muted">Captured {new Date(entry.point.capturedAt).toLocaleString()}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </section>
 
           <section className="panel">
             <div className="panel-header">
               <h2>Saved Profiles</h2>
+              <div className="panel-actions">
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => void clearAllProfiles()}
+                  disabled={deletingAllProfiles || deviceProfiles.length === 0}
+                >
+                  {deletingAllProfiles ? "Deleting..." : "Delete All Profiles"}
+                </button>
+              </div>
             </div>
             {profileValidationError ? <p className="muted">Profile validation error: {profileValidationError}</p> : null}
             <ul className="simple-list">
@@ -2109,40 +3076,61 @@ export function App(): JSX.Element {
                   </div>
                   <p className="muted">{profile.connectionType}</p>
                   <p className="muted">
-                    Calibration dry/wet: {profile.calibration.moistureDry ?? 900}/{profile.calibration.moistureWet ?? 300}
+                    Assignments: {profile.channelAssignments.length}
                   </p>
                   <p className="muted">
-                    Channels: M {profile.channelMap.moisture ?? "ch0"} | L {profile.channelMap.light ?? "ch1"} | T{" "}
-                    {profile.channelMap.temperature ?? "ch2"}
+                    {profile.channelAssignments.length > 0
+                      ? profile.channelAssignments
+                          .map((assignment) => {
+                            const plantName = plantLookup.get(assignment.plantId) ?? assignment.plantId;
+                            return `${assignment.channel} -> ${plantName}/${assignment.measurementType}`;
+                          })
+                          .join(" | ")
+                      : "No channel assignments"}
                   </p>
                   <div className="actions">
-                    <button type="button" className="ghost-button" onClick={() => openProfileEditModal(profile)}>
+                    <button type="button" className="ghost-button" onClick={() => openEditDeviceEditor(profile)}>
                       Edit Profile
                     </button>
-                    <button onClick={() => void simulateProfile(profile.id)}>Run Sim</button>
-                    <button onClick={() => void validateProfile(profile.id)} disabled={profileValidationInFlightId === profile.id}>
-                      {profileValidationInFlightId === profile.id ? "Validating..." : "Validate"}
-                    </button>
+                    {!profile.isLive ? (
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => void testSavedProfileConnection(profile)}
+                        disabled={profileTestInFlightId === profile.id}
+                      >
+                        {profileTestInFlightId === profile.id ? "Testing..." : "Test"}
+                      </button>
+                    ) : null}
                     <button onClick={() => void toggleLiveMode(profile.id, !profile.isLive)}>
                       {profile.isLive ? "Disable Live" : "Enable Live"}
                     </button>
+                    <button
+                      type="button"
+                      className="danger-button"
+                      onClick={() => void deleteProfile(profile.id)}
+                      disabled={profileDeleteInFlightId === profile.id}
+                    >
+                      {profileDeleteInFlightId === profile.id ? "Deleting..." : "Delete"}
+                    </button>
                   </div>
-                  {profileValidation[profile.id] ? (
+                  {profileConnectionTests[profile.id] ? (
                     <div className="profile-validation-block">
-                      <small>
-                        Validation: {profileValidation[profile.id]?.ok ? "ready" : "issues found"}
+                      <small className={`connection-test-result ${profileConnectionTests[profile.id]?.ok ? "ok" : "failed"}`}>
+                        Test: {profileConnectionTests[profile.id]?.ok ? "ok" : "failed"} {profileConnectionTests[profile.id]?.latencyMs}ms - {profileConnectionTests[profile.id]?.message}
                       </small>
-                      {profileValidation[profile.id]?.issues.length ? (
-                        <ul className="profile-validation-list">
-                          {profileValidation[profile.id]?.issues.map((issue, index) => (
-                            <li key={`${profile.id}-${issue.code}-${index}`} className={`issue-${issue.severity}`}>
-                              [{issue.severity}] {issue.message}
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <small>No issues reported.</small>
-                      )}
+                    </div>
+                  ) : null}
+                  {profileValidation[profile.id]?.issues.length ? (
+                    <div className="profile-validation-block">
+                      <small>Validation issues found.</small>
+                      <ul className="profile-validation-list">
+                        {profileValidation[profile.id]?.issues.map((issue, index) => (
+                          <li key={`${profile.id}-${issue.code}-${index}`} className={`issue-${issue.severity}`}>
+                            [{issue.severity}] {issue.message}
+                          </li>
+                        ))}
+                      </ul>
                     </div>
                   ) : null}
                 </li>
@@ -2152,61 +3140,37 @@ export function App(): JSX.Element {
         </section>
       ) : null}
 
-      {activePanel === "automation" ? (
+      {activePanel === "logs" ? (
         <section className="panel">
           <div className="panel-header">
-            <h2>Rules and Timeline</h2>
-            <button className="accent-button" type="button" onClick={() => setIsRuleModalOpen(true)}>
-              Create Rule
+            <h2>Flow Runtime Logs</h2>
+            <button type="button" className="ghost-button" onClick={() => void evaluateAutomation()}>
+              Evaluate Now
             </button>
           </div>
 
-          {rules.length === 0 ? <p>No rules yet.</p> : null}
-          <ul className="simple-list">
-            {rules.map((rule) => (
-              <li key={rule.id} className="compact-card">
-                <div className="profile-head">
-                  <strong>{rule.name}</strong>
-                  <span className="state-pill">{rule.enabled ? "enabled" : "disabled"}</span>
-                </div>
-                <div className="actions">
-                  <button onClick={() => void runSimulation(rule.id)}>Simulate</button>
-                  <button
-                    onClick={() => void toggleRuleEnabled(rule.id, !rule.enabled)}
-                    disabled={ruleToggleInFlightId === rule.id}
-                  >
-                    {ruleToggleInFlightId === rule.id ? "Saving..." : rule.enabled ? "Disable" : "Enable"}
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
+          <h3>Runtime Trend (Recent)</h3>
+          <div className="inline-actions">
+            <button type="button" className="ghost-button" onClick={() => void fetchRuntimeHistory()} disabled={runtimeHistoryLoading}>
+              {runtimeHistoryLoading ? "Refreshing..." : "Refresh Runtime History"}
+            </button>
+            {runtimeHistoryError ? <small>History error: {runtimeHistoryError}</small> : null}
+          </div>
+          {runtimeHistory.length === 0 && !runtimeHistoryLoading ? <p className="muted">No runtime history yet.</p> : null}
+          <div className="runtime-history-bars" aria-label="Automation runtime trend">
+            {runtimeHistory.map((entry) => {
+              const barHeight = Math.max(14, Math.min(100, entry.executedCount * 12));
+              return (
+                <article key={entry.id} className="runtime-history-bar" title={new Date(entry.capturedAt).toLocaleString()}>
+                  <span className="runtime-bar-fill" style={{ height: `${barHeight}%` }} />
+                  <strong>{entry.executedCount}</strong>
+                  <small>{new Date(entry.capturedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
+                </article>
+              );
+            })}
+          </div>
 
-          <details className="advanced-panel">
-            <summary>Advanced runtime and timeline</summary>
-
-            <h3>Runtime Trend (Recent)</h3>
-            <div className="inline-actions">
-              <button type="button" className="ghost-button" onClick={() => void fetchRuntimeHistory()} disabled={runtimeHistoryLoading}>
-                {runtimeHistoryLoading ? "Refreshing..." : "Refresh Runtime History"}
-              </button>
-              {runtimeHistoryError ? <small>History error: {runtimeHistoryError}</small> : null}
-            </div>
-            {runtimeHistory.length === 0 && !runtimeHistoryLoading ? <p className="muted">No runtime history yet.</p> : null}
-            <div className="runtime-history-bars" aria-label="Automation runtime trend">
-              {runtimeHistory.map((entry) => {
-                const barHeight = Math.max(14, Math.min(100, entry.executedCount * 12));
-                return (
-                  <article key={entry.id} className="runtime-history-bar" title={new Date(entry.capturedAt).toLocaleString()}>
-                    <span className="runtime-bar-fill" style={{ height: `${barHeight}%` }} />
-                    <strong>{entry.executedCount}</strong>
-                    <small>{new Date(entry.capturedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
-                  </article>
-                );
-              })}
-            </div>
-
-            <h3>Automation Timeline</h3>
+          <h3>Automation Timeline</h3>
             <div className="source-filter-row" role="group" aria-label="Quick source filters">
               <button
                 type="button"
@@ -2316,7 +3280,6 @@ export function App(): JSX.Element {
                 );
               })}
             </ul>
-          </details>
         </section>
       ) : null}
 
@@ -2350,102 +3313,6 @@ export function App(): JSX.Element {
               />
               <input value={draftZone} onChange={(event) => setDraftZone(event.target.value)} placeholder="Zone" />
               <button type="submit">Save Plant</button>
-            </form>
-          </section>
-        </div>
-      ) : null}
-
-      {profileEditDraft ? (
-        <div className="modal-overlay" role="presentation" onClick={() => setProfileEditDraft(null)}>
-          <section
-            className="modal-panel"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Edit device profile"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-head">
-              <h2>Edit {profileEditDraft.name}</h2>
-              <button type="button" className="ghost-button" onClick={() => setProfileEditDraft(null)}>
-                Close
-              </button>
-            </div>
-            <form className="inline-form" onSubmit={(event) => void saveProfileEdit(event)}>
-              <input
-                type="number"
-                value={profileEditDraft.moistureDry}
-                onChange={(event) =>
-                  setProfileEditDraft((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          moistureDry: event.target.value,
-                        }
-                      : prev,
-                  )
-                }
-                placeholder="moisture dry"
-              />
-              <input
-                type="number"
-                value={profileEditDraft.moistureWet}
-                onChange={(event) =>
-                  setProfileEditDraft((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          moistureWet: event.target.value,
-                        }
-                      : prev,
-                  )
-                }
-                placeholder="moisture wet"
-              />
-              <input
-                value={profileEditDraft.moistureChannel}
-                onChange={(event) =>
-                  setProfileEditDraft((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          moistureChannel: event.target.value,
-                        }
-                      : prev,
-                  )
-                }
-                placeholder="moisture channel"
-              />
-              <input
-                value={profileEditDraft.lightChannel}
-                onChange={(event) =>
-                  setProfileEditDraft((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          lightChannel: event.target.value,
-                        }
-                      : prev,
-                  )
-                }
-                placeholder="light channel"
-              />
-              <input
-                value={profileEditDraft.temperatureChannel}
-                onChange={(event) =>
-                  setProfileEditDraft((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          temperatureChannel: event.target.value,
-                        }
-                      : prev,
-                  )
-                }
-                placeholder="temperature channel"
-              />
-              <button type="submit" disabled={profileEditSaving}>
-                {profileEditSaving ? "Saving..." : "Save Profile"}
-              </button>
             </form>
           </section>
         </div>
@@ -2623,28 +3490,72 @@ export function App(): JSX.Element {
         </div>
       ) : null}
 
-      {isRuleModalOpen ? (
-        <div className="modal-overlay" role="presentation" onClick={() => setIsRuleModalOpen(false)}>
+      {securityModalOpen ? (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => {
+            if (!securitySaving) {
+              setSecurityModalOpen(false);
+            }
+          }}
+        >
           <section
             className="modal-panel"
             role="dialog"
             aria-modal="true"
-            aria-label="Create automation rule"
+            aria-label="Security settings"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="modal-head">
-              <h2>Create Rule</h2>
-              <button type="button" className="ghost-button" onClick={() => setIsRuleModalOpen(false)}>
+              <h2>Security Settings</h2>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setSecurityModalOpen(false)}
+                disabled={securitySaving}
+              >
                 Close
               </button>
             </div>
-            <form className="inline-form modal-rule-form" onSubmit={(event) => void createRule(event)}>
-              <input value={ruleName} onChange={(event) => setRuleName(event.target.value)} />
-              <button type="submit">Save Rule</button>
+            <p className="muted">Rotate your app passphrase. You will remain signed in after updating it.</p>
+            {securityError ? <p className="muted">Security error: {securityError}</p> : null}
+            {securitySuccess ? <p className="muted">{securitySuccess}</p> : null}
+            <form className="plant-form" onSubmit={(event) => void submitPassphraseChange(event)}>
+              <input
+                type="password"
+                value={currentPassphraseDraft}
+                onChange={(event) => setCurrentPassphraseDraft(event.target.value)}
+                placeholder="Current passphrase"
+                autoComplete="current-password"
+                required
+              />
+              <input
+                type="password"
+                value={newPassphraseDraft}
+                onChange={(event) => setNewPassphraseDraft(event.target.value)}
+                placeholder="New passphrase (12+ chars)"
+                autoComplete="new-password"
+                minLength={12}
+                required
+              />
+              <input
+                type="password"
+                value={confirmPassphraseDraft}
+                onChange={(event) => setConfirmPassphraseDraft(event.target.value)}
+                placeholder="Confirm new passphrase"
+                autoComplete="new-password"
+                minLength={12}
+                required
+              />
+              <button type="submit" disabled={securitySaving}>
+                {securitySaving ? "Updating..." : "Update Passphrase"}
+              </button>
             </form>
           </section>
         </div>
       ) : null}
+
     </main>
   );
 }

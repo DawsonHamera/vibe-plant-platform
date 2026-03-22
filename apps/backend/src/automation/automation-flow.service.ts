@@ -9,6 +9,7 @@ type FlowNode = {
   data: {
     label?: string;
     kind?: FlowNodeKind;
+    plantId?: string;
     metric?: "moisture" | "light" | "temperature";
     operator?: "<" | "<=" | ">" | ">=";
     value?: number;
@@ -16,7 +17,6 @@ type FlowNode = {
     seconds?: number;
     cooldownMinutes?: number;
     maxDailyRuntimeSeconds?: number;
-    plantId?: string;
   };
 };
 
@@ -142,20 +142,13 @@ export class AutomationFlowService {
         });
       }
 
-      if (sourceKind === "trigger" && targetKind === "action") {
-        issues.push({
-          severity: "warning",
-          code: "LEGACY_DIRECT_ACTION",
-          message: "Direct trigger -> action edge uses default moisture condition (< 35).",
-          nodeId: targetNode.id,
-        });
-      }
     }
 
     const actionNodes = nodes.filter((node) => this.getNodeKind(node) === "action");
     for (const actionNode of actionNodes) {
       const incomingConditionEdges = edges.filter((edge) => edge.target === actionNode.id);
       let hasCompiledRuleForAction = false;
+      let actionRuleCounter = 0;
       for (const edge of incomingConditionEdges) {
         const maybeCondition = edge.source ? nodeById.get(edge.source) : null;
         if (!maybeCondition || this.getNodeKind(maybeCondition) !== "condition") {
@@ -166,24 +159,30 @@ export class AutomationFlowService {
         issues.push(...chain.issues);
 
         const conditions = chain.conditions.length > 0 ? chain.conditions : [maybeCondition];
-        const clauses: FlowConditionClause[] = conditions.map((conditionNode) => ({
+        const conditionClauses: FlowConditionClause[] = conditions.map((conditionNode) => ({
           metric: conditionNode.data.metric ?? "moisture",
           operator: conditionNode.data.operator ?? "<",
           value: Number(conditionNode.data.value ?? 35),
         }));
 
+        const clauses: FlowConditionClause[] = chain.triggerClause
+          ? [chain.triggerClause, ...conditionClauses]
+          : conditionClauses;
+
         const primary = clauses[0] ?? { metric: "moisture", operator: "<", value: 35 };
-        const triggerPlantId = chain.triggerPlantId;
+        const scopedPlantId =
+          conditions.find((node) => typeof node.data.plantId === "string" && node.data.plantId.trim().length > 0)
+            ?.data.plantId?.trim() ?? chain.triggerPlantId;
 
         result.push({
-          name: actionNode.data.label?.trim() || `${maybeCondition.data.label?.trim() || "Flow"} Action`,
+          name: `${scope}:${actionNode.id}:${actionRuleCounter}`,
           enabled: true,
           condition: {
             metric: primary.metric,
             operator: primary.operator,
             value: primary.value,
             ...(clauses.length > 1 ? { clauses } : {}),
-            ...(triggerPlantId ? { plantId: triggerPlantId } : {}),
+            ...(scopedPlantId ? { plantId: scopedPlantId } : {}),
           },
           action: {
             target: actionNode.data.target ?? "pump",
@@ -197,10 +196,10 @@ export class AutomationFlowService {
           },
         });
 
+        actionRuleCounter += 1;
         hasCompiledRuleForAction = true;
       }
 
-      // Legacy compatibility: treat direct trigger->action edges as moisture threshold automation.
       const incomingTriggerEdges = edges.filter((edge) => edge.target === actionNode.id);
       for (const edge of incomingTriggerEdges) {
         const maybeTrigger = edge.source ? nodeById.get(edge.source) : null;
@@ -208,19 +207,25 @@ export class AutomationFlowService {
           continue;
         }
 
-        const alreadyHasConditionRule = result.some((rule) => rule.name === (actionNode.data.label?.trim() || ""));
-        if (alreadyHasConditionRule) {
-          continue;
-        }
+        const clause: FlowConditionClause = {
+          metric: maybeTrigger.data.metric ?? "moisture",
+          operator: maybeTrigger.data.operator ?? "<",
+          value: Number(maybeTrigger.data.value ?? 35),
+        };
+
+        const scopedPlantId =
+          typeof maybeTrigger.data.plantId === "string" && maybeTrigger.data.plantId.trim().length > 0
+            ? maybeTrigger.data.plantId.trim()
+            : undefined;
 
         result.push({
-          name: actionNode.data.label?.trim() || "Legacy Flow Action",
+          name: `${scope}:${actionNode.id}:${actionRuleCounter}`,
           enabled: true,
           condition: {
-            metric: "moisture",
-            operator: "<",
-            value: 35,
-            ...(maybeTrigger.data.plantId ? { plantId: maybeTrigger.data.plantId } : {}),
+            metric: clause.metric,
+            operator: clause.operator,
+            value: clause.value,
+            ...(scopedPlantId ? { plantId: scopedPlantId } : {}),
           },
           action: {
             target: actionNode.data.target ?? "pump",
@@ -234,6 +239,7 @@ export class AutomationFlowService {
           },
         });
 
+        actionRuleCounter += 1;
         hasCompiledRuleForAction = true;
       }
 
@@ -257,12 +263,18 @@ export class AutomationFlowService {
     startConditionId: string,
     nodeById: Map<string, FlowNode>,
     edges: FlowEdge[],
-  ): { conditions: FlowNode[]; triggerPlantId?: string; issues: FlowValidationIssue[] } {
+  ): {
+    conditions: FlowNode[];
+    triggerPlantId?: string;
+    triggerClause?: FlowConditionClause;
+    issues: FlowValidationIssue[];
+  } {
     const conditions: FlowNode[] = [];
     const issues: FlowValidationIssue[] = [];
     const seen = new Set<string>();
     let currentId: string | null = startConditionId;
     let triggerPlantId: string | undefined;
+    let triggerClause: FlowConditionClause | undefined;
 
     while (currentId) {
       if (seen.has(currentId)) {
@@ -323,6 +335,11 @@ export class AutomationFlowService {
           typeof trigger?.data.plantId === "string" && trigger.data.plantId.trim().length > 0
             ? trigger.data.plantId.trim()
             : undefined;
+        triggerClause = {
+          metric: trigger?.data.metric ?? "moisture",
+          operator: trigger?.data.operator ?? "<",
+          value: Number(trigger?.data.value ?? 35),
+        };
       }
 
       break;
@@ -331,6 +348,7 @@ export class AutomationFlowService {
     return {
       conditions,
       triggerPlantId,
+      triggerClause,
       issues,
     };
   }

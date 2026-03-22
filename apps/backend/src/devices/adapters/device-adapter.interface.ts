@@ -6,8 +6,16 @@ export type AdapterTestResult = {
   message: string;
 };
 
+export type AdapterChannelProbeResult = {
+  ok: boolean;
+  channels: string[];
+  message: string;
+  sample?: string;
+};
+
 export interface DeviceAdapter {
   readonly type: ConnectionType;
   discover(): Promise<string[]>;
   test(target: string): Promise<AdapterTestResult>;
+  probeChannels(target: string): Promise<AdapterChannelProbeResult>;
 }

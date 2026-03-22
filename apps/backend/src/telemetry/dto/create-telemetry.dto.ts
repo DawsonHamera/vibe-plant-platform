@@ -12,22 +12,39 @@ export class CreateTelemetryDto {
   @IsUUID()
   plantId!: string;
 
+  @IsOptional()
   @Type(() => Number)
   @IsNumber()
   @Min(0)
   @Max(100)
-  moisture!: number;
+  moisture?: number;
 
+  @IsOptional()
   @Type(() => Number)
   @IsNumber()
   @Min(0)
-  light!: number;
+  light?: number;
 
+  @IsOptional()
   @Type(() => Number)
   @IsNumber()
   @Min(-40)
   @Max(60)
-  temperature!: number;
+  temperature?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  humidity?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  reservoirLevel?: number;
 
   @IsOptional()
   @IsISO8601()

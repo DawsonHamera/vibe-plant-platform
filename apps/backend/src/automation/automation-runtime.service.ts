@@ -223,12 +223,22 @@ export class AutomationRuntimeService implements OnModuleInit, OnModuleDestroy {
 
   private matchesRuleCondition(point: TelemetryPoint, condition: RuleCondition): boolean {
     if (Array.isArray(condition.clauses) && condition.clauses.length > 0) {
-      return condition.clauses.every((clause) =>
-        this.matchesCondition(point[clause.metric], clause.operator, clause.value),
-      );
+      return condition.clauses.every((clause) => {
+        const metricValue = point[clause.metric];
+        if (metricValue === undefined) {
+          return false;
+        }
+
+        return this.matchesCondition(metricValue, clause.operator, clause.value);
+      });
     }
 
-    return this.matchesCondition(point[condition.metric], condition.operator, condition.value);
+    const metricValue = point[condition.metric];
+    if (metricValue === undefined) {
+      return false;
+    }
+
+    return this.matchesCondition(metricValue, condition.operator, condition.value);
   }
 
   private evaluateSafety(

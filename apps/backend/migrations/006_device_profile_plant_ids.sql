@@ -1,0 +1,1 @@
+ALTER TABLE device_profiles ADD COLUMN plant_ids TEXT NOT NULL DEFAULT '[]';
