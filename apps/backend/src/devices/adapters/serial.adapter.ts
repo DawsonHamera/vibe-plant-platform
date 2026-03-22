@@ -230,9 +230,10 @@ export class SerialAdapter implements DeviceAdapter {
     const sttyFlag = process.platform === "darwin" ? "-f" : "-F";
     const escapedTarget = this.escapePosixArg(target);
     const command =
-      `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 0 time 12 >/dev/null 2>&1; ` +
+      `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 1 time 20 >/dev/null 2>&1; ` +
       `cat ${escapedTarget} | head -n 20"`;
 
+    console.log(`[SERIAL DEBUG] probeChannelsOnUnix command: ${command}`);
     return this.runChannelProbe(command, target);
   }
 
@@ -240,6 +241,7 @@ export class SerialAdapter implements DeviceAdapter {
     return new Promise<AdapterChannelProbeResult>((resolve) => {
       exec(command, { timeout: 5000 }, (error, stdout, stderr) => {
         if (error) {
+          console.log(`[SERIAL DEBUG] probeChannels error for ${target}: ${stderr || error.message}`);
           resolve({
             ok: false,
             channels: [],
@@ -249,6 +251,7 @@ export class SerialAdapter implements DeviceAdapter {
         }
 
         const sample = stdout.trim();
+        console.log(`[SERIAL DEBUG] Raw output length: ${sample.length}, content raw:`, JSON.stringify(sample.substring(0, 200)));
         const channels = this.extractChannels(sample);
         if (channels.length === 0) {
           resolve({
@@ -293,24 +296,33 @@ export class SerialAdapter implements DeviceAdapter {
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
 
+    console.log(`[SERIAL DEBUG] extractChannels: ${lines.length} non-empty lines`);
+
     for (const line of lines) {
+      console.log(`[SERIAL DEBUG] Attempting to parse line: ${JSON.stringify(line.substring(0, 100))}`);
       try {
         const parsed = JSON.parse(line) as Record<string, unknown>;
+        console.log(`[SERIAL DEBUG] Parsed successfully, checking for channels...`);
         if (parsed.channels && typeof parsed.channels === "object" && !Array.isArray(parsed.channels)) {
-          return Object.keys(parsed.channels as Record<string, unknown>);
+          const channelKeys = Object.keys(parsed.channels as Record<string, unknown>);
+          console.log(`[SERIAL DEBUG] Found channels field with keys:`, channelKeys);
+          return channelKeys;
         }
 
         const topLevelChannels = Object.entries(parsed)
           .filter(([, value]) => typeof value === "number")
           .map(([key]) => key);
         if (topLevelChannels.length > 0) {
+          console.log(`[SERIAL DEBUG] Found top-level numeric fields:`, topLevelChannels);
           return topLevelChannels;
         }
-      } catch {
+      } catch (e) {
+        console.log(`[SERIAL DEBUG] JSON parse failed: ${(e as Error).message}`);
         // Continue scanning lines for valid JSON payload.
       }
     }
 
+    console.log(`[SERIAL DEBUG] No valid JSON found in any line`);
     return [];
   }
 }
