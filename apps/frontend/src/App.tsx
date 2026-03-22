@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import type { PlantRecord, TelemetryPoint } from "@vibe/shared";
 import { io } from "socket.io-client";
 import {
+  Brush,
   CartesianGrid,
   Legend,
   Line,
@@ -395,17 +396,8 @@ const graphHistoryFetchRangeByRange: Record<GraphRange, "day" | "week" | "month"
   year: "year",
 };
 
-const graphSmoothingBucketMsByRange: Record<GraphRange, number> = {
-  minute: 1000,
-  hour: 60 * 1000,
-  day: 5 * 60 * 1000,
-  week: 30 * 60 * 1000,
-  month: 2 * 60 * 60 * 1000,
-  year: 24 * 60 * 60 * 1000,
-};
-
 const maxGraphHistoryPoints = 50_000;
-const graphDomainFutureToleranceMs = 5_000;
+const maxRenderableGraphPoints = 1_200;
 
 const formatGraphTick = (timestamp: number, range: GraphRange): string => {
   const date = new Date(timestamp);
@@ -451,55 +443,6 @@ const formatGraphTooltipLabel = (timestamp: number, range: GraphRange): string =
       minute: "2-digit",
     })
     .toLowerCase();
-};
-
-const getRangeStartTimestamp = (range: GraphRange, now: Date): number => {
-  if (range === "minute") {
-    return new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      now.getHours(),
-      now.getMinutes(),
-      0,
-      0,
-    ).getTime();
-  }
-
-  if (range === "hour") {
-    return new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      now.getHours(),
-      0,
-      0,
-      0,
-    ).getTime();
-  }
-
-  if (range === "day") {
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
-  }
-
-  if (range === "week") {
-    const dayIndex = now.getDay();
-    return new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate() - dayIndex,
-      0,
-      0,
-      0,
-      0,
-    ).getTime();
-  }
-
-  if (range === "month") {
-    return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0).getTime();
-  }
-
-  return new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0).getTime();
 };
 
 const createAssignmentDraft = (channel: string, discovered = true): DeviceChannelAssignmentDraft => ({
@@ -972,11 +915,7 @@ export function App(): JSX.Element {
   const [graphViewMode, setGraphViewMode] = useState<GraphViewMode>("allPlantsSingleMetric");
   const [graphMetric, setGraphMetric] = useState<GraphMetric>("moisture");
   const [graphSelectedPlantId, setGraphSelectedPlantId] = useState<string>("");
-  const [graphNowMs, setGraphNowMs] = useState<number>(() => Date.now());
-  const [minuteWindowStartMs, setMinuteWindowStartMs] = useState<number>(() => {
-    const now = Date.now();
-    return Math.floor(now / 60_000) * 60_000;
-  });
+  const [graphBrushRange, setGraphBrushRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
   const [mobileDeviceMode, setMobileDeviceMode] = useState(false);
   const [quickActionsOpen, setQuickActionsOpen] = useState(false);
   const [isPlantModalOpen, setIsPlantModalOpen] = useState(false);
@@ -1633,7 +1572,6 @@ export function App(): JSX.Element {
 
     const socket = io({ path: "/ws/telemetry", withCredentials: true });
     socket.on("telemetry:update", (point: TelemetryView & { plantId: string }) => {
-      setGraphNowMs((prev) => Math.max(prev, Date.now()));
       setTelemetry((prev) => ({
         ...prev,
         [point.plantId]: {
@@ -1680,29 +1618,6 @@ export function App(): JSX.Element {
       socket.disconnect();
     };
   }, [authenticated, plants]);
-
-  useEffect(() => {
-    if (activePanel !== "graphs") {
-      return;
-    }
-
-    const timer = window.setInterval(() => {
-      setGraphNowMs((prev) => Math.max(prev, Date.now()));
-    }, 1000);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [activePanel]);
-
-  useEffect(() => {
-    if (graphRange !== "minute") {
-      return;
-    }
-
-    const nextMinuteStart = Math.floor(graphNowMs / 60_000) * 60_000;
-    setMinuteWindowStartMs((prev) => (prev === nextMinuteStart ? prev : nextMinuteStart));
-  }, [graphNowMs, graphRange]);
 
   const submitAuth = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -2578,12 +2493,13 @@ export function App(): JSX.Element {
   }, [graphHistory, graphMetric, graphSelectedPlantId, graphViewMode]);
 
   const graphRangeDomain = useMemo(() => {
-    const now = new Date(graphNowMs);
-    const end = graphNowMs + graphDomainFutureToleranceMs;
-    const start =
-      graphRange === "minute" ? minuteWindowStartMs : getRangeStartTimestamp(graphRange, now);
+    const latestTimestamp = graphChartData.length > 0
+      ? Number(graphChartData[graphChartData.length - 1]?.ts)
+      : Date.now();
+    const end = Number.isFinite(latestTimestamp) ? latestTimestamp : Date.now();
+    const start = end - graphRangeWindowMs[graphRange];
     return [start, end] as const;
-  }, [graphNowMs, graphRange, minuteWindowStartMs]);
+  }, [graphChartData, graphRange]);
 
   const graphChartDataInRange = useMemo(
     () =>
@@ -2593,70 +2509,14 @@ export function App(): JSX.Element {
     [graphChartData, graphRangeDomain],
   );
 
-  const graphChartDataSmoothed = useMemo(() => {
-    if (graphChartDataInRange.length === 0) {
-      return [] as GraphChartRow[];
+  const graphChartDataRenderable = useMemo(() => {
+    if (graphChartDataInRange.length <= maxRenderableGraphPoints) {
+      return graphChartDataInRange;
     }
 
-    const bucketMs = graphSmoothingBucketMsByRange[graphRange];
-    const buckets = new Map<
-      number,
-      {
-        sums: Record<string, number>;
-        counts: Record<string, number>;
-      }
-    >();
-
-    for (const entry of graphChartDataInRange) {
-      const ts = Number(entry.ts);
-      if (!Number.isFinite(ts)) {
-        continue;
-      }
-
-      const bucketTs = Math.floor(ts / bucketMs) * bucketMs;
-      const current = buckets.get(bucketTs) ?? { sums: {}, counts: {} };
-
-      Object.entries(entry).forEach(([key, value]) => {
-        if (key === "timestamp" || key === "ts") {
-          return;
-        }
-
-        if (typeof value !== "number" || Number.isNaN(value)) {
-          return;
-        }
-
-        current.sums[key] = (current.sums[key] ?? 0) + value;
-        current.counts[key] = (current.counts[key] ?? 0) + 1;
-      });
-
-      buckets.set(bucketTs, current);
-    }
-
-    return Array.from(buckets.entries())
-      .sort((a, b) => a[0] - b[0])
-      .map(([bucketTs, aggregate]) => {
-        const row: GraphChartRow = {
-          timestamp: new Date(bucketTs).toISOString(),
-          ts: bucketTs,
-        };
-
-        Object.keys(aggregate.sums).forEach((key) => {
-          const count = aggregate.counts[key] ?? 0;
-          const sum = aggregate.sums[key];
-          if (count <= 0) {
-            return;
-          }
-
-          if (sum === undefined) {
-            return;
-          }
-
-          row[key] = Math.round((sum / count) * 100) / 100;
-        });
-
-        return row;
-      });
-  }, [graphChartDataInRange, graphRange]);
+    const stride = Math.ceil(graphChartDataInRange.length / maxRenderableGraphPoints);
+    return graphChartDataInRange.filter((_, index) => index % stride === 0 || index === graphChartDataInRange.length - 1);
+  }, [graphChartDataInRange]);
 
   const graphLineDefinitions = useMemo(() => {
     if (graphViewMode === "allPlantsSingleMetric") {
@@ -2674,6 +2534,10 @@ export function App(): JSX.Element {
       color: graphLinePalette[index % graphLinePalette.length] ?? "#58b2f4",
     }));
   }, [graphHistory, graphViewMode, plantLookup]);
+
+  useEffect(() => {
+    setGraphBrushRange(null);
+  }, [graphRange, graphViewMode, graphMetric, graphSelectedPlantId]);
   const editorProfile = useMemo(
     () => deviceProfiles.find((profile) => profile.id === deviceEditorProfileId) ?? null,
     [deviceEditorProfileId, deviceProfiles],
@@ -4011,11 +3875,14 @@ export function App(): JSX.Element {
 
           <div className="graphs-hero">
             <div className="graphs-canvas-wrap">
-              {graphChartDataSmoothed.length === 0 ? (
+              {graphChartDataRenderable.length === 0 ? (
                 <p className="muted">No telemetry history for this range yet.</p>
               ) : (
                 <ResponsiveContainer width="100%" height={460}>
-                  <LineChart data={graphChartDataSmoothed} margin={{ top: 14, right: 18, bottom: 14, left: 4 }}>
+                  <LineChart
+                    data={graphChartDataRenderable}
+                    margin={{ top: 14, right: 18, bottom: 14, left: 4 }}
+                  >
                     <CartesianGrid stroke="#2a4055" strokeDasharray="4 4" />
                     <XAxis
                       type="number"
@@ -4046,9 +3913,37 @@ export function App(): JSX.Element {
                         isAnimationActive={false}
                       />
                     ))}
+                    <Brush
+                      dataKey="ts"
+                      height={26}
+                      stroke="#4fdad3"
+                      travellerWidth={10}
+                      startIndex={graphBrushRange?.startIndex}
+                      endIndex={graphBrushRange?.endIndex}
+                      onChange={(next) => {
+                        if (!next || next.startIndex === undefined || next.endIndex === undefined) {
+                          setGraphBrushRange(null);
+                          return;
+                        }
+
+                        setGraphBrushRange({
+                          startIndex: Number(next.startIndex),
+                          endIndex: Number(next.endIndex),
+                        });
+                      }}
+                      tickFormatter={(value) => formatGraphTick(Number(value), graphRange)}
+                    />
                   </LineChart>
                 </ResponsiveContainer>
               )}
+            </div>
+            <div className="inline-actions">
+              <button type="button" className="ghost-button" onClick={() => setGraphBrushRange(null)}>
+                Reset Zoom
+              </button>
+              <small className="muted">
+                Live updates stream continuously. Drag the range handles to zoom the timeline.
+              </small>
             </div>
           </div>
         </section>
