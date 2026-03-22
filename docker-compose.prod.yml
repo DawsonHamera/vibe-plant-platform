@@ -1,34 +1,12 @@
 services:
-  backend:
-    build:
-      context: .
-      dockerfile: apps/backend/Dockerfile
-    environment:
-      HOST: ${HOST:-0.0.0.0}
-      PORT: ${PORT:-3000}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
-      SQLITE_DB_FILE: ${SQLITE_DB_FILE:-data/vibe-plant.sqlite}
-      UPLOADS_DIR: ${UPLOADS_DIR:-data/uploads}
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${PORT:-3000}/health >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 6
-      start_period: 10s
-    volumes:
-      - vibe_backend_data:/app/apps/backend/data
-
   frontend:
     build:
       context: .
       dockerfile: apps/frontend/Dockerfile
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
+        VITE_API_BASE_URL: /api
     ports:
-      - "${FRONTEND_PORT:-8080}:80"
+      - "${FRONTEND_PORT:-48080}:80"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null || exit 1"]
@@ -36,8 +14,5 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
-    depends_on:
-      - backend
-
-volumes:
-  vibe_backend_data:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

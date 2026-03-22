@@ -40,14 +40,20 @@ export type DeviceMeasurementType =
   | "humidity"
   | "reservoirLevel";
 
+type DeviceTemperatureUnit = "celsius" | "fahrenheit";
+
 export type DeviceChannelAssignment = {
   channel: string;
-  plantId: string;
-  measurementType: DeviceMeasurementType;
+  plantId?: string;
+  measurementType?: DeviceMeasurementType;
+  ioType?: "input" | "output";
+  outputLabel?: string;
   calibration?: {
     inputMin?: number;
     inputMax?: number;
     clamp?: boolean;
+    inputUnit?: DeviceTemperatureUnit;
+    outputUnit?: DeviceTemperatureUnit;
   };
 };
 
@@ -271,9 +277,16 @@ export class DevicesService {
       });
     }
 
-    const assignmentSignatures = assignments.map((assignment) =>
-      `${assignment.channel.trim().toLowerCase()}::${assignment.plantId}::${assignment.measurementType}`,
-    );
+    const assignmentSignatures = assignments.map((assignment) => {
+      const ioType = assignment.ioType ?? "input";
+      if (ioType === "output") {
+        return `output::${assignment.channel.trim().toLowerCase()}`;
+      }
+
+      return `${assignment.channel.trim().toLowerCase()}::${String(assignment.plantId ?? "")}::${String(
+        assignment.measurementType ?? "",
+      )}`;
+    });
     if (new Set(assignmentSignatures).size !== assignmentSignatures.length) {
       issues.push({
         severity: "warning",
@@ -283,12 +296,35 @@ export class DevicesService {
     }
 
     for (const assignment of assignments) {
+      const ioType = assignment.ioType ?? "input";
+
       if (!assignment.channel || assignment.channel.trim().length === 0) {
         issues.push({
           severity: "error",
           code: "ASSIGNMENT_CHANNEL_REQUIRED",
           message: "Every assignment must include a channel label.",
         });
+      }
+
+      if (ioType === "output") {
+        if (!assignment.outputLabel || assignment.outputLabel.trim().length === 0) {
+          issues.push({
+            severity: "warning",
+            code: "OUTPUT_LABEL_RECOMMENDED",
+            message: `Output assignment on ${assignment.channel} should include an output label for flow actions.`,
+          });
+        }
+
+        continue;
+      }
+
+      if (!assignment.plantId || !assignment.measurementType) {
+        issues.push({
+          severity: "error",
+          code: "ASSIGNMENT_INPUT_INCOMPLETE",
+          message: `Input assignment on ${assignment.channel} must include plant and measurement type.`,
+        });
+        continue;
       }
 
       try {
@@ -317,6 +353,19 @@ export class DevicesService {
             severity: "error",
             code: "CALIBRATION_RANGE_INVALID",
             message: `Calibration min must be less than max for channel ${assignment.channel}.`,
+          });
+        }
+      } else if (assignment.measurementType === "temperature") {
+        const inputUnit = assignment.calibration?.inputUnit;
+        const outputUnit = assignment.calibration?.outputUnit;
+        const isValidUnit = (value: string | undefined): boolean =>
+          value === undefined || value === "celsius" || value === "fahrenheit";
+
+        if (!isValidUnit(inputUnit) || !isValidUnit(outputUnit)) {
+          issues.push({
+            severity: "error",
+            code: "TEMPERATURE_UNIT_INVALID",
+            message: `Temperature assignment on ${assignment.channel} must use celsius or fahrenheit units.`,
           });
         }
       }
@@ -401,6 +450,14 @@ export class DevicesService {
 
     const pointsByPlant = new Map<string, TelemetryPoint>();
     for (const assignment of assignments) {
+      if ((assignment.ioType ?? "input") === "output") {
+        continue;
+      }
+
+      if (!assignment.plantId || !assignment.measurementType) {
+        continue;
+      }
+
       const rawValue = Number(normalizedChannels[assignment.channel]);
       if (!Number.isFinite(rawValue)) {
         continue;
@@ -620,21 +677,49 @@ export class DevicesService {
                 ...(typeof (calibrationRaw as Record<string, unknown>).clamp === "boolean"
                   ? { clamp: (calibrationRaw as Record<string, unknown>).clamp as boolean }
                   : {}),
+                ...(["celsius", "fahrenheit"].includes(
+                  String((calibrationRaw as Record<string, unknown>).inputUnit ?? "").toLowerCase(),
+                )
+                  ? {
+                      inputUnit: String(
+                        (calibrationRaw as Record<string, unknown>).inputUnit,
+                      ).toLowerCase() as DeviceTemperatureUnit,
+                    }
+                  : {}),
+                ...(["celsius", "fahrenheit"].includes(
+                  String((calibrationRaw as Record<string, unknown>).outputUnit ?? "").toLowerCase(),
+                )
+                  ? {
+                      outputUnit: String(
+                        (calibrationRaw as Record<string, unknown>).outputUnit,
+                      ).toLowerCase() as DeviceTemperatureUnit,
+                    }
+                  : {}),
               }
             : undefined;
 
         return {
           channel: String(raw.channel ?? "").trim(),
-          plantId: String(raw.plantId ?? "").trim(),
-          measurementType,
+          ...(typeof raw.plantId === "string" && String(raw.plantId).trim().length > 0
+            ? { plantId: String(raw.plantId).trim() }
+            : {}),
+          ...(allowedTypes.includes(measurementType) ? { measurementType } : {}),
+          ...(String(raw.ioType ?? "input").toLowerCase() === "output"
+            ? { ioType: "output" as const }
+            : { ioType: "input" as const }),
+          ...(typeof raw.outputLabel === "string" && String(raw.outputLabel).trim().length > 0
+            ? { outputLabel: String(raw.outputLabel).trim() }
+            : {}),
           ...(calibration ? { calibration } : {}),
         };
       })
       .filter(
         (assignment) =>
           assignment.channel.length > 0 &&
-          assignment.plantId.length > 0 &&
-          allowedTypes.includes(assignment.measurementType),
+          ((assignment.ioType ?? "input") === "output" ||
+            (Boolean(assignment.plantId) &&
+              Boolean(assignment.measurementType) &&
+              allowedTypes.includes(assignment.measurementType as DeviceMeasurementType))),
       );
   }
 
@@ -642,6 +727,22 @@ export class DevicesService {
     const min = assignment.calibration?.inputMin;
     const max = assignment.calibration?.inputMax;
     const shouldClamp = assignment.calibration?.clamp !== false;
+
+    if (assignment.measurementType === "temperature") {
+      const inputUnit = assignment.calibration?.inputUnit ?? "celsius";
+      const outputUnit = assignment.calibration?.outputUnit ?? "celsius";
+      let temperature = rawValue;
+
+      if (inputUnit !== outputUnit) {
+        if (inputUnit === "fahrenheit" && outputUnit === "celsius") {
+          temperature = ((rawValue - 32) * 5) / 9;
+        } else if (inputUnit === "celsius" && outputUnit === "fahrenheit") {
+          temperature = (rawValue * 9) / 5 + 32;
+        }
+      }
+
+      return Math.round(temperature * 10) / 10;
+    }
 
     if (assignment.measurementType !== "moisture") {
       return Math.round(rawValue * 10) / 10;

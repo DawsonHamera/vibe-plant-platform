@@ -31,7 +31,7 @@ const rule: AutomationRule = {
   name: "Dry soil pump",
   enabled: true,
   condition: { metric: "moisture", operator: "<", value: 35 },
-  action: { target: "pump", seconds: 8 },
+  action: { type: "deviceOutput", target: "profile-1:ch1", seconds: 8 },
   safety: { cooldownMinutes: 60, maxDailyRuntimeSeconds: 10 },
   createdAt: nowIso,
   updatedAt: nowIso,
@@ -62,7 +62,7 @@ describe("AutomationRuntimeService", () => {
 
     const plantsService = {
       list: () => [plant],
-      markWatered: () => plant,
+      update: () => plant,
     };
 
     const telemetryState = {
@@ -121,7 +121,7 @@ describe("AutomationRuntimeService", () => {
 
     const plantsService = {
       list: () => [plant],
-      markWatered: () => plant,
+      update: () => plant,
     };
 
     const telemetryState = {
@@ -162,7 +162,7 @@ describe("AutomationRuntimeService", () => {
 
     const plantsService = {
       list: () => [plant],
-      markWatered: () => plant,
+      update: () => plant,
     };
 
     const telemetryState = {
@@ -225,7 +225,7 @@ describe("AutomationRuntimeService", () => {
 
     const plantsService = {
       list: () => [plant],
-      markWatered: () => plant,
+      update: () => plant,
     };
 
     const telemetryState = {
@@ -280,7 +280,7 @@ describe("AutomationRuntimeService", () => {
 
     const plantsService = {
       list: () => [plant],
-      markWatered: () => plant,
+      update: () => plant,
     };
 
     const telemetryState = {

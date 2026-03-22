@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import type { PlantHealthState } from "@vibe/shared";
 import { DiagramsService } from "../diagrams/diagrams.service";
 import { AutomationRule, AutomationService } from "./automation.service";
 
@@ -13,7 +14,9 @@ type FlowNode = {
     metric?: "moisture" | "light" | "temperature";
     operator?: "<" | "<=" | ">" | ">=";
     value?: number;
-    target?: "pump" | "mister" | "relay";
+    actionType?: "deviceOutput" | "updatePlantStatus";
+    target?: string;
+    status?: PlantHealthState;
     seconds?: number;
     cooldownMinutes?: number;
     maxDailyRuntimeSeconds?: number;
@@ -169,6 +172,18 @@ export class AutomationFlowService {
           ? [chain.triggerClause, ...conditionClauses]
           : conditionClauses;
 
+        const actionType = actionNode.data.actionType ?? "deviceOutput";
+        const actionTarget = String(actionNode.data.target ?? "").trim();
+        if (actionType === "deviceOutput" && actionTarget.length === 0) {
+          issues.push({
+            severity: "error",
+            code: "ACTION_TARGET_REQUIRED",
+            message: "Device output action requires selecting a hardware output target.",
+            nodeId: actionNode.id,
+          });
+          continue;
+        }
+
         const primary = clauses[0] ?? { metric: "moisture", operator: "<", value: 35 };
         const scopedPlantId =
           conditions.find((node) => typeof node.data.plantId === "string" && node.data.plantId.trim().length > 0)
@@ -185,7 +200,11 @@ export class AutomationFlowService {
             ...(scopedPlantId ? { plantId: scopedPlantId } : {}),
           },
           action: {
-            target: actionNode.data.target ?? "pump",
+            type: actionType,
+            target: actionTarget,
+            ...(actionType === "updatePlantStatus"
+              ? { status: actionNode.data.status ?? "watch" }
+              : {}),
             seconds: Number(actionNode.data.seconds ?? 8),
           },
           safety: {
@@ -218,6 +237,18 @@ export class AutomationFlowService {
             ? maybeTrigger.data.plantId.trim()
             : undefined;
 
+        const actionType = actionNode.data.actionType ?? "deviceOutput";
+        const actionTarget = String(actionNode.data.target ?? "").trim();
+        if (actionType === "deviceOutput" && actionTarget.length === 0) {
+          issues.push({
+            severity: "error",
+            code: "ACTION_TARGET_REQUIRED",
+            message: "Device output action requires selecting a hardware output target.",
+            nodeId: actionNode.id,
+          });
+          continue;
+        }
+
         result.push({
           name: `${scope}:${actionNode.id}:${actionRuleCounter}`,
           enabled: true,
@@ -228,7 +259,11 @@ export class AutomationFlowService {
             ...(scopedPlantId ? { plantId: scopedPlantId } : {}),
           },
           action: {
-            target: actionNode.data.target ?? "pump",
+            type: actionType,
+            target: actionTarget,
+            ...(actionType === "updatePlantStatus"
+              ? { status: actionNode.data.status ?? "watch" }
+              : {}),
             seconds: Number(actionNode.data.seconds ?? 8),
           },
           safety: {
@@ -363,7 +398,7 @@ export class AutomationFlowService {
       return "condition";
     }
 
-    if (label.includes("action") || label.includes("pump") || label.includes("mister") || label.includes("relay")) {
+    if (label.includes("action") || label.includes("output") || label.includes("status")) {
       return "action";
     }
 

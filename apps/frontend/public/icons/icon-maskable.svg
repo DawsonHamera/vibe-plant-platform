@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Vibe Plant maskable icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f2d45"/>
+      <stop offset="100%" stop-color="#0c1e30"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#52d9a8"/>
+      <stop offset="100%" stop-color="#2fa783"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="128" fill="url(#bg)"/>
+  <path d="M256 396c-12 0-21-9-21-21V220c0-12 9-21 21-21s21 9 21 21v155c0 12-9 21-21 21z" fill="#9be0d3"/>
+  <path d="M250 270c-67 0-120-52-120-120 67 0 120 53 120 120z" fill="url(#leaf)"/>
+  <path d="M262 270c67 0 120-52 120-120-67 0-120 53-120 120z" fill="url(#leaf)"/>
+  <rect x="144" y="354" width="224" height="30" rx="15" fill="#365777"/>
+</svg>

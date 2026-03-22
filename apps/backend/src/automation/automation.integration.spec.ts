@@ -41,7 +41,7 @@ describe("Automation Evaluate Integration", () => {
         name: "Dry soil pump",
         enabled: true,
         condition: { metric: "moisture", operator: "<", value: 35 },
-        action: { target: "pump", seconds: 5 },
+        action: { type: "deviceOutput", target: "profile-a:ch1", seconds: 5 },
         safety: { cooldownMinutes: 60, maxDailyRuntimeSeconds: 60 },
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -112,7 +112,7 @@ describe("Automation Evaluate Integration", () => {
       // Mock plants service
       const plantsService = {
         list: () => [plant],
-        markWatered: () => plant,
+        update: () => plant,
       };
 
       // Mock telemetry state service
@@ -164,7 +164,7 @@ describe("Automation Evaluate Integration", () => {
         name: "High temp pump",
         enabled: true,
         condition: { metric: "temperature", operator: ">", value: 28 },
-        action: { target: "pump", seconds: 30 },
+        action: { type: "deviceOutput", target: "profile-a:ch2", seconds: 30 },
         safety: { cooldownMinutes: 5, maxDailyRuntimeSeconds: 40 },
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -190,7 +190,7 @@ describe("Automation Evaluate Integration", () => {
 
       const plantsService = {
         list: () => [plant],
-        markWatered: () => plant,
+        update: () => plant,
       };
 
       const telemetryState = {
@@ -230,7 +230,7 @@ describe("Automation Evaluate Integration", () => {
         name: "Light pump",
         enabled: true,
         condition: { metric: "light", operator: "<", value: 150 },
-        action: { target: "light", seconds: 10 },
+        action: { type: "deviceOutput", target: "profile-a:ch3", seconds: 10 },
         safety: { cooldownMinutes: 10, maxDailyRuntimeSeconds: 100 },
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -255,7 +255,7 @@ describe("Automation Evaluate Integration", () => {
 
       const plantsService = {
         list: () => [plant],
-        markWatered: () => plant,
+        update: () => plant,
       };
 
       const telemetryState = {

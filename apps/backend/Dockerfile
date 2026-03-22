@@ -21,12 +21,18 @@ FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app/apps/backend
 
+# Install openssl for certificate generation
+RUN apk add --no-cache openssl
+
 COPY --from=deps /app/node_modules /app/node_modules
 COPY --from=build /app/packages/shared /app/packages/shared
 COPY --from=build /app/apps/backend/dist ./dist
 COPY --from=build /app/apps/backend/migrations ./migrations
 COPY apps/backend/package.json ./package.json
+COPY apps/backend/entrypoint.sh ./entrypoint.sh
+
+RUN chmod +x ./entrypoint.sh
 
 EXPOSE 3000
 
-CMD ["node", "dist/main.js"]
+ENTRYPOINT ["./entrypoint.sh"]

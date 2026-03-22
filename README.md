@@ -2,6 +2,18 @@
 
 Monorepo foundation for a production-ready plant management and automation platform.
 
+## What Changed Recently
+- Production ports are now standardized for local deployment:
+   - Backend: `43000`
+   - Frontend: `48080`
+- Authentication is enabled for production with passphrase + signed session cookie.
+- Frontend now uses same-origin API routing (`/api`) for tunnel-safe operation.
+- Nginx in frontend proxies API, uploads, and realtime websocket paths.
+- Production runtime now uses one clear mode: host backend with dockerized frontend.
+- Mobile UX was enhanced (responsive panel/tabs behavior, touch-friendly controls, modal bottom-sheet behavior, scroll locking).
+- App is now PWA-ready (manifest, service worker, install metadata, home-screen icons).
+- Mobile devices now use a dedicated in-app bottom tabbar layout while preserving the same content domains.
+
 ## Workspace
 - `apps/frontend`: React + TypeScript application.
 - `apps/backend`: NestJS API and realtime gateway.
@@ -9,6 +21,49 @@ Monorepo foundation for a production-ready plant management and automation platf
 
 ## Deployment
 - Production deployment and operator procedures: `docs/deployment-runbook.md`
+
+## Production Runtime
+
+Production now uses a single runtime topology to avoid mix-ups:
+- Backend runs on host (required for COM/serial access).
+- Frontend runs in Docker and proxies to host backend.
+
+Run backend on host:
+
+```bash
+npm run prod:backend:run-host
+```
+
+Deploy frontend container:
+
+```bash
+npm run prod:frontend:deploy
+```
+
+Stop frontend container:
+
+```bash
+npm run prod:frontend:stop
+```
+
+View frontend container logs:
+
+```bash
+npm run prod:frontend:logs
+```
+
+Check frontend container status:
+
+```bash
+npm run prod:frontend:status
+```
+
+Notes:
+- `docker-compose.prod.yml` now runs frontend only.
+- `apps/frontend/nginx.conf` proxies:
+   - `/api/* -> host.docker.internal:43000/*`
+   - `/uploads/* -> host.docker.internal:43000/uploads/*`
+   - `/ws/telemetry` and `/socket.io/*` websocket upgrades to host backend.
 
 ## Implemented API Surface
 - `GET /health`
@@ -153,6 +208,11 @@ Realtime:
 - WebSocket endpoint path: `/ws/telemetry`
 - Event: `telemetry:update`
 
+Realtime notes:
+- Frontend Socket.IO client connects on current site origin with `path: /ws/telemetry`.
+- In tunneled production, ensure the tunnel points to frontend (`:48080`) and let nginx proxy websocket traffic to backend.
+- If realtime appears stale after deploy, purge tunnel/CDN cache for `/` and `/assets/*`, then hard refresh.
+
 ## Quick start
 1. Install dependencies:
    - `npm install`
@@ -163,6 +223,48 @@ Realtime:
 4. Run backend migrations manually (optional; startup also applies migrations):
    - `npm run migrate --workspace @vibe/backend`
 
+## Tunnel Setup (HTTPS Public Domain)
+
+For public domain access, terminate HTTPS at your tunnel provider and route only to frontend.
+
+- Public hostname -> local frontend `http://localhost:48080`
+- Frontend internally proxies API/uploads/websocket to backend
+
+This avoids browser private-network restrictions from public HTTPS origins and keeps API/websocket same-origin from the browser's point of view.
+
+Recommended env values:
+
+```env
+PORT=43000
+FRONTEND_PORT=48080
+VITE_API_BASE_URL=/api
+CORS_ORIGINS=http://localhost:48080,https://localhost:48080,http://127.0.0.1:48080,https://127.0.0.1:48080,https://planthub.deloro3dpc.tech
+```
+
+Authentication env values required for production:
+
+```env
+VIBE_AUTH_PASSPHRASE=<long-random-passphrase>
+VIBE_AUTH_SECRET=<long-random-signing-secret>
+VIBE_AUTH_COOKIE_SECURE=false
+```
+
+Set `VIBE_AUTH_COOKIE_SECURE=true` when traffic is consistently HTTPS end-to-end at the app edge.
+
+## PWA and Mobile App Mode
+
+- Manifest: `apps/frontend/public/manifest.webmanifest`
+- Service worker: `apps/frontend/public/sw.js`
+- Icons: `apps/frontend/public/icons/*`
+
+Behavior:
+- Desktop/web keeps the existing multi-panel dashboard layout.
+- Mobile devices switch to a dedicated app layout with fixed bottom tabbar navigation (`Overview`, `Plants`, `Devices`, `Logs`, `Flows`).
+- Core content remains the same; the mobile mode prioritizes one domain at a time to reduce cramped UI.
+
+Install (mobile):
+- Open the app in mobile browser and use `Add to Home Screen` / `Install App`.
+
 ## Quality commands
 - `npm run lint`
 - `npm run typecheck`
@@ -172,6 +274,16 @@ Realtime:
 ## Troubleshooting
 - If image upload returns `Cannot POST /plants/:id/image`, the backend process is likely running an older `dist` build.
 - Restart backend after rebuilding (`npm run build` then `npm run start --workspace @vibe/backend`) or run watch mode (`npm run dev:backend`) during development.
+- If uploaded images appear in API data but not in UI, verify:
+   - frontend is using `VITE_API_BASE_URL=/api`
+   - nginx has `/uploads/` proxy configured
+   - backend serves static uploads under `/uploads`
+- If websocket closes immediately:
+   - ensure backend is running on expected port (`43000`)
+   - ensure no backend port conflict (`EADDRINUSE`)
+   - ensure tunnel domain is included in `CORS_ORIGINS`
+   - hard-refresh to load latest frontend assets after websocket changes
+- If COM/serial devices are unavailable in production, use hybrid mode (backend on host + frontend in Docker).
 
 ## CI
-- GitHub Actions workflow at `.github/workflows/ci.yml` runs install, typecheck, lint, test, and build on pushes and pull requests.
+- GitHub Actions workflow at `.github/workflows/ci.yml` is manual (`workflow_dispatch`) and focused on frontend validation/build artifact flow.

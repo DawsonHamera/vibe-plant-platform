@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
-import type { TelemetryPoint } from "@vibe/shared";
+import type { PlantHealthState, TelemetryPoint } from "@vibe/shared";
 import { PlantsService } from "../plants/plants.service";
 import { TelemetryStateService } from "../telemetry/telemetry-state.service";
 import { AutomationService, AutomationRule } from "./automation.service";
@@ -16,10 +16,17 @@ type RuleCondition = {
   }>;
 };
 
-type RuleAction = {
-  target: "pump" | "mister" | "relay";
-  seconds: number;
-};
+type RuleAction =
+  | {
+      type: "deviceOutput";
+      target: string;
+      seconds: number;
+    }
+  | {
+      type: "updatePlantStatus";
+      status: PlantHealthState;
+      seconds: number;
+    };
 
 type RuleSafety = {
   cooldownMinutes: number;
@@ -138,17 +145,22 @@ export class AutomationRuntimeService implements OnModuleInit, OnModuleDestroy {
             plantId: plant.id,
             metric: condition.metric,
             value: point[condition.metric],
-            actionTarget: action.target,
+            actionType: action.type,
+            ...(action.type === "deviceOutput"
+              ? { actionTarget: action.target }
+              : { nextHealthState: action.status }),
             runtimeSeconds: action.seconds,
           },
           createdAt: now.toISOString(),
         });
 
-        if (action.target === "pump") {
-          this.plantsService.markWatered(plant.id);
+        if (action.type === "updatePlantStatus") {
+          this.plantsService.update(plant.id, { healthState: action.status });
         }
 
-        this.logger.log(`Rule ${rule.id} executed for plant ${plant.id} (${action.target}/${action.seconds}s)`);
+        this.logger.log(
+          `Rule ${rule.id} executed for plant ${plant.id} (${action.type}/${action.seconds}s)`,
+        );
 
         executions += 1;
       }
@@ -201,9 +213,22 @@ export class AutomationRuntimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private parseAction(rule: AutomationRule): RuleAction {
+    const actionType = String(rule.action.type ?? "deviceOutput");
+    const seconds = Number(rule.action.seconds ?? 6);
+
+    if (actionType === "updatePlantStatus") {
+      const status = String(rule.action.status ?? "watch") as PlantHealthState;
+      return {
+        type: "updatePlantStatus",
+        status,
+        seconds: Number.isFinite(seconds) ? Math.max(0, seconds) : 0,
+      };
+    }
+
     return {
-      target: (rule.action.target as RuleAction["target"]) ?? "pump",
-      seconds: Number(rule.action.seconds ?? 6),
+      type: "deviceOutput",
+      target: String(rule.action.target ?? ""),
+      seconds: Number.isFinite(seconds) ? Math.max(0, seconds) : 0,
     };
   }
 

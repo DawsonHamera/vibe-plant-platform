@@ -74,6 +74,53 @@ export class TelemetryController {
     return this.telemetryState.getStats();
   }
 
+  @Get("history")
+  history(
+    @Query("range") range?: "day" | "week" | "month" | "year",
+    @Query("plantId") plantId?: string,
+    @Query("plantIds") plantIds?: string,
+    @Query("limit") limit?: string,
+  ): TelemetryPoint[] {
+    const span = range ?? "day";
+    const now = Date.now();
+    const spanMsByRange = {
+      day: 24 * 60 * 60 * 1000,
+      week: 7 * 24 * 60 * 60 * 1000,
+      month: 31 * 24 * 60 * 60 * 1000,
+      year: 366 * 24 * 60 * 60 * 1000,
+    } as const;
+
+    const sinceIso = new Date(now - spanMsByRange[span]).toISOString();
+    const defaultLimitByRange = {
+      day: 2_500,
+      week: 8_000,
+      month: 15_000,
+      year: 40_000,
+    } as const;
+
+    const parsedLimit = Number.parseInt(limit ?? "", 10);
+    const queryLimit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(parsedLimit, 50_000))
+      : defaultLimitByRange[span];
+
+    const requestedPlantIds = [
+      ...(plantId ? [plantId] : []),
+      ...(plantIds
+        ? plantIds
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+        : []),
+    ];
+    const uniquePlantIds = Array.from(new Set(requestedPlantIds));
+
+    return this.telemetryState.getHistory({
+      sinceIso,
+      limit: queryLimit,
+      ...(uniquePlantIds.length > 0 ? { plantIds: uniquePlantIds } : {}),
+    });
+  }
+
   @Get(":plantId")
   latestByPathParam(
     @Param("plantId", new ParseUUIDPipe({ version: "4" })) plantId: string,

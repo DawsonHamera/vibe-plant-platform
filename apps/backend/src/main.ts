@@ -32,6 +32,7 @@ async function bootstrap(): Promise<void> {
   );
 
   await app.listen(runtime.port, runtime.host);
+  console.log(`✅ Application listening on ${runtime.host}:${runtime.port}`);
 }
 
 bootstrap();

@@ -18,7 +18,8 @@ describe("AutomationFlowService", () => {
             data: {
               kind: "action",
               label: "Water Pump",
-              target: "pump",
+              actionType: "deviceOutput",
+              target: "profile-1:ch1",
               seconds: 7,
               cooldownMinutes: 45,
               maxDailyRuntimeSeconds: 120,
@@ -42,9 +43,9 @@ describe("AutomationFlowService", () => {
     expect(result.compiledRuleCount).toBe(1);
     expect(automationService.replaceDiagramRules).toHaveBeenCalledTimes(1);
     const firstRule = result.rules[0] as Record<string, unknown>;
-    expect(firstRule.name).toBe("Water Pump");
-    expect(firstRule.condition).toMatchObject({ metric: "moisture", operator: "<", value: 30, plantId: "plant-1" });
-    expect(firstRule.action).toMatchObject({ target: "pump", seconds: 7 });
+    expect(firstRule.name).toBe("dashboard:action-1:0");
+    expect(firstRule.condition).toMatchObject({ metric: "moisture", operator: "<", value: 35, plantId: "plant-1" });
+    expect(firstRule.action).toMatchObject({ type: "deviceOutput", target: "profile-1:ch1", seconds: 7 });
   });
 
   it("returns validation issues in preview for unsupported edge types", () => {
@@ -77,7 +78,7 @@ describe("AutomationFlowService", () => {
         updatedAt: new Date().toISOString(),
         nodes: [
           { id: "start", data: { label: "Sensor Input" } },
-          { id: "action", data: { label: "Water Pump Action", target: "pump", seconds: 6 } },
+          { id: "action", data: { label: "Water Pump Action", actionType: "deviceOutput", target: "profile-1:ch1", seconds: 6 } },
         ],
         edges: [{ source: "start", target: "action" }],
       })),
@@ -92,7 +93,7 @@ describe("AutomationFlowService", () => {
     expect(result.compiledRuleCount).toBe(1);
     const firstRule = result.rules[0] as Record<string, unknown>;
     expect(firstRule.condition).toMatchObject({ metric: "moisture", operator: "<", value: 35 });
-    expect(result.issues.some((issue) => issue.code === "LEGACY_DIRECT_ACTION")).toBe(true);
+    expect(result.issues.some((issue) => issue.code === "ACTION_TARGET_REQUIRED")).toBe(false);
   });
 
   it("supports condition-to-condition chaining as an AND clause set", () => {
@@ -112,7 +113,7 @@ describe("AutomationFlowService", () => {
           },
           {
             id: "action-1",
-            data: { kind: "action", label: "Pump", target: "pump", seconds: 8 },
+            data: { kind: "action", label: "Pump", actionType: "deviceOutput", target: "profile-1:ch1", seconds: 8 },
           },
         ],
         edges: [
@@ -133,6 +134,6 @@ describe("AutomationFlowService", () => {
 
     expect(result.compiledRuleCount).toBe(1);
     expect(Array.isArray(condition.clauses)).toBe(true);
-    expect((condition.clauses as Array<Record<string, unknown>>).length).toBe(2);
+    expect((condition.clauses as Array<Record<string, unknown>>).length).toBe(3);
   });
 });

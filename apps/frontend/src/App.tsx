@@ -1,6 +1,16 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PlantRecord, TelemetryPoint } from "@vibe/shared";
 import { io } from "socket.io-client";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import ReactFlow, {
   Background,
   ConnectionLineType,
@@ -18,9 +28,16 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 
-const apiBase = (import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:3000").replace(/\/$/, "");
+const apiBase = (import.meta.env.VITE_API_BASE_URL?.trim() || "/api").replace(/\/$/, "");
 const authDeviceKey = "vibe_auth_device";
 const unauthorizedEvent = "vibe:auth-unauthorized";
+
+const getBrowserOrigin = (): string | null => {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  return window.location.origin;
+};
 
 type DailyDecision = {
   date: string;
@@ -28,6 +45,8 @@ type DailyDecision = {
   overduePlantIds: string[];
   alerts: string[];
 };
+
+type PanelId = "overview" | "plants" | "devices" | "graphs" | "logs" | "flows";
 
 type TelemetryView = {
   moisture?: number;
@@ -42,14 +61,28 @@ type TelemetryView = {
 
 type DeviceMeasurementType = "moisture" | "temperature" | "light" | "humidity" | "reservoirLevel";
 
+type GraphMetric = DeviceMeasurementType;
+
+type GraphRange = "minute" | "hour" | "day" | "week" | "month" | "year";
+
+type GraphViewMode = "allPlantsSingleMetric" | "singlePlantOverlay";
+
+type DeviceTemperatureUnit = "celsius" | "fahrenheit";
+
+type DeviceAssignmentIoType = "input" | "output";
+
 type DeviceChannelAssignment = {
   channel: string;
-  plantId: string;
-  measurementType: DeviceMeasurementType;
+  plantId?: string;
+  measurementType?: DeviceMeasurementType;
+  ioType?: DeviceAssignmentIoType;
+  outputLabel?: string;
   calibration?: {
     inputMin?: number;
     inputMax?: number;
     clamp?: boolean;
+    inputUnit?: DeviceTemperatureUnit;
+    outputUnit?: DeviceTemperatureUnit;
   };
 };
 
@@ -148,11 +181,16 @@ type AutomationRuntimeHistoryEntry = {
 
 type DeviceChannelAssignmentDraft = {
   channel: string;
+  discovered: boolean;
   plantId: string;
   measurementType: DeviceMeasurementType;
+  ioType: DeviceAssignmentIoType;
+  outputLabel: string;
   inputMin: string;
   inputMax: string;
   clamp: boolean;
+  temperatureInputUnit: DeviceTemperatureUnit;
+  temperatureOutputUnit: DeviceTemperatureUnit;
 };
 
 type PlantEditDraft = {
@@ -173,7 +211,7 @@ type DiagramMetric = "moisture" | "light" | "temperature";
 
 type DiagramOperator = "<" | "<=" | ">" | ">=";
 
-type DiagramActionTarget = "pump" | "mister" | "relay";
+type DiagramActionType = "deviceOutput" | "updatePlantStatus";
 
 type DiagramNodeData = {
   label: string;
@@ -184,7 +222,10 @@ type DiagramNodeData = {
   metric?: DiagramMetric;
   operator?: DiagramOperator;
   value?: number;
-  target?: DiagramActionTarget;
+  actionType?: DiagramActionType;
+  target?: string;
+  status?: PlantRecord["healthState"];
+  outputOptions?: Array<{ value: string; label: string }>;
   seconds?: number;
   cooldownMinutes?: number;
   maxDailyRuntimeSeconds?: number;
@@ -225,6 +266,24 @@ type PlatformHealthDetails = {
     error?: string;
   };
 };
+
+type PlantGraphPoint = {
+  plantId: string;
+  nickname: string;
+  imageUrl?: string;
+  capturedAt: string;
+  moisture?: number;
+  light?: number;
+  temperature?: number;
+  humidity?: number;
+  reservoirLevel?: number;
+};
+
+type GraphChartRow = {
+  timestamp: string;
+  ts: number;
+  [key: string]: string | number | undefined;
+};
 type DiagramApiSnapshot = DiagramSnapshot & {
   scope: string;
   updatedAt: string;
@@ -249,9 +308,11 @@ const defaultDiagramNodes: Node<DiagramNodeData>[] = [
     id: "action",
     position: { x: 660, y: 210 },
     data: {
-      label: "Water Pump",
+      label: "Device Output",
       kind: "action",
-      target: "pump",
+      actionType: "deviceOutput",
+      target: "",
+      status: "watch",
       seconds: 8,
       cooldownMinutes: 60,
       maxDailyRuntimeSeconds: 90,
@@ -297,49 +358,231 @@ const measurementTypeOptions: DeviceMeasurementType[] = [
   "reservoirLevel",
 ];
 
-const createAssignmentDraft = (channel: string): DeviceChannelAssignmentDraft => ({
+const graphMetricOptions: Array<{ value: GraphMetric; label: string; unit: string }> = [
+  { value: "moisture", label: "Moisture", unit: "%" },
+  { value: "humidity", label: "Humidity", unit: "%" },
+  { value: "temperature", label: "Temperature", unit: "" },
+  { value: "light", label: "Light", unit: "" },
+  { value: "reservoirLevel", label: "Reservoir", unit: "%" },
+];
+
+const graphRangeOptions: Array<{ value: GraphRange; label: string }> = [
+  { value: "minute", label: "Minute" },
+  { value: "hour", label: "Hour" },
+  { value: "day", label: "Day" },
+  { value: "week", label: "Week" },
+  { value: "month", label: "Month" },
+  { value: "year", label: "Year" },
+];
+
+const graphLinePalette = ["#53d2a8", "#58b2f4", "#f1c15e", "#ff7e95", "#9f9df3", "#4fdad3", "#f5946d"];
+
+const graphRangeWindowMs: Record<GraphRange, number> = {
+  minute: 60 * 1000,
+  hour: 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 31 * 24 * 60 * 60 * 1000,
+  year: 366 * 24 * 60 * 60 * 1000,
+};
+
+const graphHistoryFetchRangeByRange: Record<GraphRange, "day" | "week" | "month" | "year"> = {
+  minute: "day",
+  hour: "day",
+  day: "day",
+  week: "week",
+  month: "month",
+  year: "year",
+};
+
+const graphSmoothingBucketMsByRange: Record<GraphRange, number> = {
+  minute: 1000,
+  hour: 60 * 1000,
+  day: 5 * 60 * 1000,
+  week: 30 * 60 * 1000,
+  month: 2 * 60 * 60 * 1000,
+  year: 24 * 60 * 60 * 1000,
+};
+
+const maxGraphHistoryPoints = 50_000;
+const graphDomainFutureToleranceMs = 5_000;
+
+const formatGraphTick = (timestamp: number, range: GraphRange): string => {
+  const date = new Date(timestamp);
+  if (range === "minute") {
+    return date
+      .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      .toLowerCase();
+  }
+
+  if (range === "hour") {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  if (range === "day") {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  if (range === "week") {
+    return date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  }
+
+  if (range === "month") {
+    return date.toLocaleDateString([], { month: "short", day: "2-digit" });
+  }
+
+  return date.toLocaleDateString([], { month: "short", year: "2-digit" });
+};
+
+const formatGraphTooltipLabel = (timestamp: number, range: GraphRange): string => {
+  if (range === "minute") {
+    return new Date(timestamp)
+      .toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+      .toLowerCase();
+  }
+
+  return new Date(timestamp)
+    .toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    })
+    .toLowerCase();
+};
+
+const getRangeStartTimestamp = (range: GraphRange, now: Date): number => {
+  if (range === "minute") {
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      now.getHours(),
+      now.getMinutes(),
+      0,
+      0,
+    ).getTime();
+  }
+
+  if (range === "hour") {
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      now.getHours(),
+      0,
+      0,
+      0,
+    ).getTime();
+  }
+
+  if (range === "day") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+  }
+
+  if (range === "week") {
+    const dayIndex = now.getDay();
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() - dayIndex,
+      0,
+      0,
+      0,
+      0,
+    ).getTime();
+  }
+
+  if (range === "month") {
+    return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0).getTime();
+  }
+
+  return new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0).getTime();
+};
+
+const createAssignmentDraft = (channel: string, discovered = true): DeviceChannelAssignmentDraft => ({
   channel,
+  discovered,
   plantId: "",
   measurementType: "moisture",
+  ioType: "input",
+  outputLabel: "",
   inputMin: "",
   inputMax: "",
   clamp: true,
+  temperatureInputUnit: "celsius",
+  temperatureOutputUnit: "celsius",
 });
 
 const toAssignmentDraft = (assignment: DeviceChannelAssignment): DeviceChannelAssignmentDraft => ({
   channel: assignment.channel,
-  plantId: assignment.plantId,
-  measurementType: assignment.measurementType,
+  discovered: false,
+  plantId: assignment.plantId ?? "",
+  measurementType: assignment.measurementType ?? "moisture",
+  ioType: assignment.ioType === "output" ? "output" : "input",
+  outputLabel: assignment.outputLabel ?? "",
   inputMin: assignment.calibration?.inputMin === undefined ? "" : String(assignment.calibration.inputMin),
   inputMax: assignment.calibration?.inputMax === undefined ? "" : String(assignment.calibration.inputMax),
   clamp: assignment.calibration?.clamp !== false,
+  temperatureInputUnit: assignment.calibration?.inputUnit === "fahrenheit" ? "fahrenheit" : "celsius",
+  temperatureOutputUnit: assignment.calibration?.outputUnit === "fahrenheit" ? "fahrenheit" : "celsius",
 });
 
 const toChannelAssignmentsPayload = (
   drafts: DeviceChannelAssignmentDraft[],
 ): DeviceChannelAssignment[] => {
   return drafts
-    .filter((draft) => draft.channel.trim().length > 0 && draft.plantId.trim().length > 0)
+    .filter((draft) => draft.channel.trim().length > 0)
     .map((draft) => {
       const inputMin = Number(draft.inputMin);
       const inputMax = Number(draft.inputMax);
 
       const calibration =
-        draft.measurementType === "moisture"
+        draft.ioType === "input" && draft.measurementType === "moisture"
           ? {
               ...(Number.isFinite(inputMin) ? { inputMin } : {}),
               ...(Number.isFinite(inputMax) ? { inputMax } : {}),
               clamp: draft.clamp,
             }
+          : draft.ioType === "input" && draft.measurementType === "temperature"
+            ? {
+                inputUnit: draft.temperatureInputUnit,
+                outputUnit: draft.temperatureOutputUnit,
+              }
           : undefined;
 
       return {
         channel: draft.channel.trim(),
-        plantId: draft.plantId,
-        measurementType: draft.measurementType,
+        ioType: draft.ioType,
+        ...(draft.ioType === "input"
+          ? {
+              plantId: draft.plantId,
+              measurementType: draft.measurementType,
+            }
+          : {
+              outputLabel: draft.outputLabel.trim().length > 0 ? draft.outputLabel.trim() : draft.channel.trim(),
+            }),
         ...(calibration ? { calibration } : {}),
       };
-    });
+    })
+    .filter(
+      (assignment) =>
+        assignment.channel.length > 0 &&
+        ((assignment.ioType ?? "input") === "output" ||
+          (("plantId" in assignment && Boolean(assignment.plantId)) &&
+            ("measurementType" in assignment && Boolean(assignment.measurementType)))),
+    );
+};
+
+const nextManualOutputChannel = (drafts: DeviceChannelAssignmentDraft[]): string => {
+  const used = new Set(drafts.map((entry) => entry.channel.trim().toLowerCase()));
+  let index = 1;
+  while (used.has(`output-${index}`)) {
+    index += 1;
+  }
+  return `output-${index}`;
 };
 
 function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Element {
@@ -478,15 +721,44 @@ function FlowNodeCard({ data, selected }: NodeProps<DiagramNodeData>): JSX.Eleme
         <div className="flow-node-grid action-grid">
           <select
             className="flow-node-input nodrag nopan"
-            value={data.target ?? "pump"}
-            onChange={(event) => data.onPatch?.({ target: event.target.value as DiagramActionTarget })}
+            value={data.actionType ?? "deviceOutput"}
+            onChange={(event) => data.onPatch?.({ actionType: event.target.value as DiagramActionType })}
+            aria-label="Action type"
+            disabled={readOnly}
+          >
+            <option value="deviceOutput">device output</option>
+            <option value="updatePlantStatus">update plant status</option>
+          </select>
+
+          {data.actionType === "updatePlantStatus" ? (
+            <select
+              className="flow-node-input nodrag nopan"
+              value={data.status ?? "watch"}
+              onChange={(event) => data.onPatch?.({ status: event.target.value as PlantRecord["healthState"] })}
+              aria-label="Plant status"
+              disabled={readOnly}
+            >
+              <option value="excellent">excellent</option>
+              <option value="good">good</option>
+              <option value="watch">watch</option>
+              <option value="critical">critical</option>
+            </select>
+          ) : (
+          <select
+            className="flow-node-input nodrag nopan"
+            value={data.target ?? ""}
+            onChange={(event) => data.onPatch?.({ target: event.target.value })}
             aria-label="Action target"
             disabled={readOnly}
           >
-            <option value="pump">pump</option>
-            <option value="mister">mister</option>
-            <option value="relay">relay</option>
+            <option value="">Select hardware output</option>
+            {(data.outputOptions ?? []).map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
           </select>
+          )}
           <label className="flow-node-field-label">Seconds</label>
           <input
             type="number"
@@ -607,8 +879,18 @@ const resolvePlantImageUrl = (imageUrl: string | undefined): string | null => {
     // Fall through and resolve as a relative backend path.
   }
 
+  const browserOrigin = getBrowserOrigin();
+  if (imageUrl.startsWith("/") && browserOrigin) {
+    try {
+      return new URL(imageUrl, browserOrigin).toString();
+    } catch {
+      return null;
+    }
+  }
+
   try {
-    return new URL(imageUrl, apiBase).toString();
+    const resolutionBase = browserOrigin ? new URL(apiBase, browserOrigin).toString() : apiBase;
+    return new URL(imageUrl, resolutionBase).toString();
   } catch {
     return null;
   }
@@ -682,9 +964,20 @@ export function App(): JSX.Element {
   const [deletingAllProfiles, setDeletingAllProfiles] = useState(false);
   const [lastTelemetryEventAt, setLastTelemetryEventAt] = useState<string | null>(null);
   const [lastEvaluationExecutions, setLastEvaluationExecutions] = useState<number | null>(null);
-  const [activePanel, setActivePanel] = useState<"overview" | "plants" | "devices" | "logs" | "flows">(
-    "overview",
-  );
+  const [activePanel, setActivePanel] = useState<PanelId>("overview");
+  const [graphHistory, setGraphHistory] = useState<PlantGraphPoint[]>([]);
+  const [graphHistoryLoading, setGraphHistoryLoading] = useState(false);
+  const [graphHistoryError, setGraphHistoryError] = useState<string | null>(null);
+  const [graphRange, setGraphRange] = useState<GraphRange>("week");
+  const [graphViewMode, setGraphViewMode] = useState<GraphViewMode>("allPlantsSingleMetric");
+  const [graphMetric, setGraphMetric] = useState<GraphMetric>("moisture");
+  const [graphSelectedPlantId, setGraphSelectedPlantId] = useState<string>("");
+  const [graphNowMs, setGraphNowMs] = useState<number>(() => Date.now());
+  const [minuteWindowStartMs, setMinuteWindowStartMs] = useState<number>(() => {
+    const now = Date.now();
+    return Math.floor(now / 60_000) * 60_000;
+  });
+  const [mobileDeviceMode, setMobileDeviceMode] = useState(false);
   const [quickActionsOpen, setQuickActionsOpen] = useState(false);
   const [isPlantModalOpen, setIsPlantModalOpen] = useState(false);
   const [plantEditDraft, setPlantEditDraft] = useState<PlantEditDraft | null>(null);
@@ -695,6 +988,7 @@ export function App(): JSX.Element {
   const [profileValidationError, setProfileValidationError] = useState<string | null>(null);
   const [imageUploadInFlightId, setImageUploadInFlightId] = useState<string | null>(null);
   const [imageUploadError, setImageUploadError] = useState<string | null>(null);
+  const anyModalOpen = securityModalOpen || isPlantModalOpen || plantEditDraft !== null;
   const [diagramReady, setDiagramReady] = useState(false);
   const [diagramNodes, setDiagramNodes, onDiagramNodesChange] = useNodesState<DiagramNodeData>([]);
   const [diagramEdges, setDiagramEdges, onDiagramEdgesChange] = useEdgesState([]);
@@ -714,6 +1008,7 @@ export function App(): JSX.Element {
   const [healthLoading, setHealthLoading] = useState(false);
   const [healthError, setHealthError] = useState<string | null>(null);
   const diagramHydratedRef = useRef(false);
+  const graphHistoryRequestSeqRef = useRef(0);
 
   const plantLookup = useMemo(
     () => new Map(plants.map((plant) => [plant.id, plant.nickname])),
@@ -738,6 +1033,25 @@ export function App(): JSX.Element {
       })),
     [plants],
   );
+
+  const diagramOutputOptions = useMemo(() => {
+    return deviceProfiles.flatMap((profile) =>
+      (profile.channelAssignments ?? [])
+        .filter((assignment) => (assignment.ioType ?? "input") === "output")
+        .map((assignment) => {
+          const channel = assignment.channel.trim();
+          const outputLabel =
+            typeof assignment.outputLabel === "string" && assignment.outputLabel.trim().length > 0
+              ? assignment.outputLabel.trim()
+              : channel;
+
+          return {
+            value: `${profile.id}:${channel}`,
+            label: `${profile.name} / ${outputLabel}`,
+          };
+        }),
+    );
+  }, [deviceProfiles]);
 
   const updateDiagramNodeDataById = useCallback(
     (nodeId: string, partial: Partial<DiagramNodeData>) => {
@@ -773,12 +1087,13 @@ export function App(): JSX.Element {
           ...node.data,
           readOnly: flowLiveMode,
           plantOptions: diagramPlantOptions,
+          outputOptions: diagramOutputOptions,
           plantImageUrl: diagramPlantOptions.find((option) => option.id === node.data.plantId)?.imageUrl,
           onPatch: (partial: Partial<DiagramNodeData>) => updateDiagramNodeDataById(node.id, partial),
           onLabelChange: (label: string) => updateDiagramNodeDataById(node.id, { label }),
         },
       })),
-    [diagramNodes, diagramPlantOptions, flowLiveMode, updateDiagramNodeDataById],
+    [diagramNodes, diagramPlantOptions, diagramOutputOptions, flowLiveMode, updateDiagramNodeDataById],
   );
 
   const diagramEdgesForCanvas = useMemo(
@@ -925,6 +1240,70 @@ export function App(): JSX.Element {
       setTelemetryStatsLoading(false);
     }
   };
+
+  const fetchGraphHistory = useCallback(async (): Promise<void> => {
+    const requestSeq = ++graphHistoryRequestSeqRef.current;
+    const requestStartedAt = Date.now();
+    setGraphHistoryLoading(true);
+    setGraphHistoryError(null);
+
+    try {
+      const params = new URLSearchParams({ range: graphHistoryFetchRangeByRange[graphRange] });
+      const response = await fetch(`${apiBase}/telemetry/history?${params.toString()}`);
+      if (!response.ok) {
+        throw new Error(`Telemetry history request failed with status ${response.status}`);
+      }
+
+      const payload = (await response.json()) as TelemetryPoint[];
+      const next = (Array.isArray(payload) ? payload : [])
+        .map((point) => {
+          const plant = plants.find((entry) => entry.id === point.plantId);
+          return {
+            plantId: point.plantId,
+            nickname: plant?.nickname ?? point.plantId,
+            imageUrl: resolvePlantImageUrl(plant?.imageUrl ?? undefined) ?? undefined,
+            capturedAt: point.capturedAt,
+            ...(point.moisture !== undefined ? { moisture: point.moisture } : {}),
+            ...(point.light !== undefined ? { light: point.light } : {}),
+            ...(point.temperature !== undefined ? { temperature: point.temperature } : {}),
+            ...(point.humidity !== undefined ? { humidity: point.humidity } : {}),
+            ...(point.reservoirLevel !== undefined ? { reservoirLevel: point.reservoirLevel } : {}),
+          } satisfies PlantGraphPoint;
+        })
+        .sort((a, b) => Date.parse(a.capturedAt) - Date.parse(b.capturedAt));
+
+      if (requestSeq !== graphHistoryRequestSeqRef.current) {
+        return;
+      }
+
+      setGraphHistory((prev) => {
+        const recentLivePoints = prev.filter((point) => Date.parse(point.capturedAt) > requestStartedAt);
+        const mergedByKey = new Map<string, PlantGraphPoint>();
+
+        for (const point of [...next, ...recentLivePoints]) {
+          mergedByKey.set(`${point.plantId}|${point.capturedAt}`, point);
+        }
+
+        const merged = Array.from(mergedByKey.values()).sort(
+          (a, b) => Date.parse(a.capturedAt) - Date.parse(b.capturedAt),
+        );
+        return merged.length > maxGraphHistoryPoints
+          ? merged.slice(merged.length - maxGraphHistoryPoints)
+          : merged;
+      });
+    } catch (error) {
+      if (requestSeq !== graphHistoryRequestSeqRef.current) {
+        return;
+      }
+
+      setGraphHistoryError(error instanceof Error ? error.message : "Unable to load graph telemetry history.");
+      setGraphHistory([]);
+    } finally {
+      if (requestSeq === graphHistoryRequestSeqRef.current) {
+        setGraphHistoryLoading(false);
+      }
+    }
+  }, [graphRange, plants]);
 
   const fetchHealthDetails = async (): Promise<void> => {
     setHealthLoading(true);
@@ -1162,6 +1541,54 @@ export function App(): JSX.Element {
       return;
     }
 
+    void fetchGraphHistory();
+  }, [authenticated, fetchGraphHistory]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    if (anyModalOpen) {
+      document.body.style.overflow = "hidden";
+      return () => {
+        document.body.style.overflow = previousOverflow;
+      };
+    }
+
+    document.body.style.overflow = previousOverflow;
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [anyModalOpen]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const query = window.matchMedia("(max-width: 820px)");
+    const ua = window.navigator.userAgent || "";
+    const isMobileUa = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+
+    const applyMode = (): void => {
+      setMobileDeviceMode(isMobileUa || query.matches);
+    };
+
+    applyMode();
+    query.addEventListener("change", applyMode);
+
+    return () => {
+      query.removeEventListener("change", applyMode);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
     void loadDiagramSnapshotFromApi();
   }, [authenticated, setDiagramEdges, setDiagramNodes]);
 
@@ -1204,8 +1631,9 @@ export function App(): JSX.Element {
       return;
     }
 
-    const socket = io(apiBase, { path: "/ws/telemetry", withCredentials: true });
+    const socket = io({ path: "/ws/telemetry", withCredentials: true });
     socket.on("telemetry:update", (point: TelemetryView & { plantId: string }) => {
+      setGraphNowMs((prev) => Math.max(prev, Date.now()));
       setTelemetry((prev) => ({
         ...prev,
         [point.plantId]: {
@@ -1220,12 +1648,61 @@ export function App(): JSX.Element {
         },
       }));
       setLastTelemetryEventAt(point.capturedAt);
+      const plant = plants.find((entry) => entry.id === point.plantId);
+      setGraphHistory((prev) => {
+        const nextPoint: PlantGraphPoint = {
+          plantId: point.plantId,
+          nickname: plant?.nickname ?? point.plantId,
+          imageUrl: resolvePlantImageUrl(plant?.imageUrl ?? undefined) ?? undefined,
+          capturedAt: point.capturedAt,
+          ...(point.moisture !== undefined ? { moisture: point.moisture } : {}),
+          ...(point.light !== undefined ? { light: point.light } : {}),
+          ...(point.temperature !== undefined ? { temperature: point.temperature } : {}),
+          ...(point.humidity !== undefined ? { humidity: point.humidity } : {}),
+          ...(point.reservoirLevel !== undefined ? { reservoirLevel: point.reservoirLevel } : {}),
+        };
+
+        const mergedByKey = new Map<string, PlantGraphPoint>();
+        for (const item of [...prev, nextPoint]) {
+          mergedByKey.set(`${item.plantId}|${item.capturedAt}`, item);
+        }
+
+        const merged = Array.from(mergedByKey.values()).sort(
+          (a, b) => Date.parse(a.capturedAt) - Date.parse(b.capturedAt),
+        );
+        return merged.length > maxGraphHistoryPoints
+          ? merged.slice(merged.length - maxGraphHistoryPoints)
+          : merged;
+      });
     });
 
     return () => {
       socket.disconnect();
     };
-  }, [authenticated]);
+  }, [authenticated, plants]);
+
+  useEffect(() => {
+    if (activePanel !== "graphs") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setGraphNowMs((prev) => Math.max(prev, Date.now()));
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activePanel]);
+
+  useEffect(() => {
+    if (graphRange !== "minute") {
+      return;
+    }
+
+    const nextMinuteStart = Math.floor(graphNowMs / 60_000) * 60_000;
+    setMinuteWindowStartMs((prev) => (prev === nextMinuteStart ? prev : nextMinuteStart));
+  }, [graphNowMs, graphRange]);
 
   const submitAuth = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -1517,7 +1994,7 @@ export function App(): JSX.Element {
     const response = await fetch(`${apiBase}/automation/evaluate`, { method: "POST" });
     const payload = (await response.json()) as { executed: number };
     setLastEvaluationExecutions(payload.executed);
-    await Promise.all([fetchRuntimeStatus(), fetchRuntimeHistory()]);
+    await Promise.all([fetchRuntimeStatus(), fetchRuntimeHistory(), refreshPlantsAndDecision()]);
   };
 
   const saveDeviceProfile = async (event: FormEvent): Promise<void> => {
@@ -1603,10 +2080,10 @@ export function App(): JSX.Element {
                 const next = [...prev];
                 liveChannels.forEach((channel) => {
                   if (!next.some((entry) => entry.channel === channel)) {
-                    next.push(createAssignmentDraft(channel));
+                    next.push(createAssignmentDraft(channel, true));
                   }
                 });
-                return next.filter((entry) => liveChannels.includes(entry.channel));
+                return next.filter((entry) => entry.ioType === "output" || liveChannels.includes(entry.channel));
               });
               return;
             }
@@ -1645,10 +2122,10 @@ export function App(): JSX.Element {
         const next = [...prev];
         channels.forEach((channel) => {
           if (!next.some((entry) => entry.channel === channel)) {
-            next.push(createAssignmentDraft(channel));
+            next.push(createAssignmentDraft(channel, true));
           }
         });
-        return next.filter((entry) => channels.includes(entry.channel));
+        return next.filter((entry) => entry.ioType === "output" || channels.includes(entry.channel));
       });
     } catch (error) {
       setChannelProbeError(error instanceof Error ? error.message : "Unable to probe channels.");
@@ -1861,10 +2338,13 @@ export function App(): JSX.Element {
     void fetchTimeline(nextFilters);
   };
 
-  const jumpToPanel = (panel: "plants" | "devices" | "logs" | "flows"): void => {
+  const jumpToPanel = (panel: Exclude<PanelId, "overview">): void => {
     setActivePanel(panel);
     setQuickActionsOpen(false);
   };
+
+  const showMobileTabbar = mobileDeviceMode;
+  const showOverviewPrelude = activePanel === "overview";
 
   const onDiagramConnect = useCallback(
     (connection: Connection) => {
@@ -1938,7 +2418,9 @@ export function App(): JSX.Element {
       action: {
         label: "Action",
         kind: "action",
-        target: "pump",
+        actionType: "deviceOutput",
+        target: "",
+        status: "watch",
         seconds: 8,
         cooldownMinutes: 60,
         maxDailyRuntimeSeconds: 90,
@@ -2049,6 +2531,149 @@ export function App(): JSX.Element {
   }, [plantLookup, profileLookup, telemetry]);
   const isTelemetryStreamActive =
     lastTelemetryEventAt !== null && Date.now() - Date.parse(lastTelemetryEventAt) < 20_000;
+  const graphPlantOptions = useMemo(
+    () =>
+      plants.map((plant) => ({
+        id: plant.id,
+        nickname: plant.nickname,
+      })),
+    [plants],
+  );
+
+  const graphChartData = useMemo(() => {
+    const bucketByTimestamp = new Map<string, GraphChartRow>();
+
+    for (const point of graphHistory) {
+      const timestampKey = new Date(point.capturedAt).toISOString();
+      const ts = Date.parse(point.capturedAt);
+      if (!Number.isFinite(ts)) {
+        continue;
+      }
+      const existing =
+        bucketByTimestamp.get(timestampKey) ??
+        {
+          timestamp: point.capturedAt,
+          ts,
+        };
+
+      if (graphViewMode === "allPlantsSingleMetric") {
+        const value = point[graphMetric];
+        if (value !== undefined && !Number.isNaN(value)) {
+          existing[point.plantId] = value;
+        }
+      } else if (graphSelectedPlantId.length > 0 && point.plantId === graphSelectedPlantId) {
+        graphMetricOptions.forEach((metricOption) => {
+          const value = point[metricOption.value];
+          if (value !== undefined && !Number.isNaN(value)) {
+            existing[metricOption.value] = value;
+          }
+        });
+      }
+
+      bucketByTimestamp.set(timestampKey, existing);
+    }
+
+    return Array.from(bucketByTimestamp.values())
+      .sort((a, b) => Number(a.ts) - Number(b.ts));
+  }, [graphHistory, graphMetric, graphSelectedPlantId, graphViewMode]);
+
+  const graphRangeDomain = useMemo(() => {
+    const now = new Date(graphNowMs);
+    const end = graphNowMs + graphDomainFutureToleranceMs;
+    const start =
+      graphRange === "minute" ? minuteWindowStartMs : getRangeStartTimestamp(graphRange, now);
+    return [start, end] as const;
+  }, [graphNowMs, graphRange, minuteWindowStartMs]);
+
+  const graphChartDataInRange = useMemo(
+    () =>
+      graphChartData.filter(
+        (entry) => Number(entry.ts) >= graphRangeDomain[0] && Number(entry.ts) <= graphRangeDomain[1],
+      ),
+    [graphChartData, graphRangeDomain],
+  );
+
+  const graphChartDataSmoothed = useMemo(() => {
+    if (graphChartDataInRange.length === 0) {
+      return [] as GraphChartRow[];
+    }
+
+    const bucketMs = graphSmoothingBucketMsByRange[graphRange];
+    const buckets = new Map<
+      number,
+      {
+        sums: Record<string, number>;
+        counts: Record<string, number>;
+      }
+    >();
+
+    for (const entry of graphChartDataInRange) {
+      const ts = Number(entry.ts);
+      if (!Number.isFinite(ts)) {
+        continue;
+      }
+
+      const bucketTs = Math.floor(ts / bucketMs) * bucketMs;
+      const current = buckets.get(bucketTs) ?? { sums: {}, counts: {} };
+
+      Object.entries(entry).forEach(([key, value]) => {
+        if (key === "timestamp" || key === "ts") {
+          return;
+        }
+
+        if (typeof value !== "number" || Number.isNaN(value)) {
+          return;
+        }
+
+        current.sums[key] = (current.sums[key] ?? 0) + value;
+        current.counts[key] = (current.counts[key] ?? 0) + 1;
+      });
+
+      buckets.set(bucketTs, current);
+    }
+
+    return Array.from(buckets.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([bucketTs, aggregate]) => {
+        const row: GraphChartRow = {
+          timestamp: new Date(bucketTs).toISOString(),
+          ts: bucketTs,
+        };
+
+        Object.keys(aggregate.sums).forEach((key) => {
+          const count = aggregate.counts[key] ?? 0;
+          const sum = aggregate.sums[key];
+          if (count <= 0) {
+            return;
+          }
+
+          if (sum === undefined) {
+            return;
+          }
+
+          row[key] = Math.round((sum / count) * 100) / 100;
+        });
+
+        return row;
+      });
+  }, [graphChartDataInRange, graphRange]);
+
+  const graphLineDefinitions = useMemo(() => {
+    if (graphViewMode === "allPlantsSingleMetric") {
+      const allPlantIds = Array.from(new Set(graphHistory.map((point) => point.plantId)));
+      return allPlantIds.map((plantId, index) => ({
+        key: plantId,
+        label: plantLookup.get(plantId) ?? plantId,
+        color: graphLinePalette[index % graphLinePalette.length] ?? "#58b2f4",
+      }));
+    }
+
+    return graphMetricOptions.map((metricOption, index) => ({
+      key: metricOption.value,
+      label: metricOption.label,
+      color: graphLinePalette[index % graphLinePalette.length] ?? "#58b2f4",
+    }));
+  }, [graphHistory, graphViewMode, plantLookup]);
   const editorProfile = useMemo(
     () => deviceProfiles.find((profile) => profile.id === deviceEditorProfileId) ?? null,
     [deviceEditorProfileId, deviceProfiles],
@@ -2084,6 +2709,18 @@ export function App(): JSX.Element {
       .slice(0, 4)
       .map((entry) => entry.plant);
   }, [decision, plants]);
+
+  useEffect(() => {
+    if (graphSelectedPlantId.length > 0) {
+      return;
+    }
+
+    if (graphPlantOptions.length === 0) {
+      return;
+    }
+
+    setGraphSelectedPlantId(graphPlantOptions[0]?.id ?? "");
+  }, [graphPlantOptions, graphSelectedPlantId]);
 
   if (authChecking) {
     return (
@@ -2121,7 +2758,9 @@ export function App(): JSX.Element {
   }
 
   return (
-    <main className="app-shell dashboard-shell">
+    <main
+      className={`app-shell dashboard-shell ${mobileDeviceMode ? "mobile-device-layout" : ""} ${activePanel === "flows" ? "flows-focus" : ""}`}
+    >
       <header className="app-header panel">
         <div>
           <p className="eyebrow">Control Center</p>
@@ -2152,7 +2791,7 @@ export function App(): JSX.Element {
         </div>
       </header>
 
-      <section className="summary-row">
+      {showOverviewPrelude ? <section className="summary-row">
         <article className="summary-card">
           <p>Total Plants</p>
           <strong>{plants.length}</strong>
@@ -2169,9 +2808,9 @@ export function App(): JSX.Element {
           <p>Applied Flow Rules</p>
           <strong>{enabledRuleCount}</strong>
         </article>
-      </section>
+      </section> : null}
 
-      <section className="panel hero-plants-panel" aria-label="Featured plants">
+      {showOverviewPrelude ? <section className="panel hero-plants-panel" aria-label="Featured plants">
         <div className="panel-header">
           <h2>Plant Focus</h2>
           <p className="muted">Daily priorities with quick care actions.</p>
@@ -2199,12 +2838,13 @@ export function App(): JSX.Element {
                     <strong>{plant.nickname}</strong>
                     <span className="state-pill">{statusLabel}</span>
                   </div>
+                  <p className="muted">Plant status: {plant.healthState}</p>
                   <p className="muted">
                     {plant.species} in {plant.zone}
                   </p>
                   <p className="muted">
                     {latestTelemetry
-                      ? `Moisture ${formatMeasurement(latestTelemetry.moisture, "%")} | Light ${formatMeasurement(latestTelemetry.light)} | Temp ${formatMeasurement(latestTelemetry.temperature, "C")}`
+                      ? `Moisture ${formatMeasurement(latestTelemetry.moisture, "%")} | Light ${formatMeasurement(latestTelemetry.light)} | Temp ${formatMeasurement(latestTelemetry.temperature)}`
                       : "No telemetry yet"}
                   </p>
                   <div className="actions">
@@ -2220,9 +2860,9 @@ export function App(): JSX.Element {
             );
           })}
         </ul>
-      </section>
+      </section> : null}
 
-      <section className="panel quick-actions-panel">
+      {showOverviewPrelude ? <section className="panel quick-actions-panel">
         <div className="panel-header">
           <h2>Quick Actions</h2>
           <button
@@ -2266,9 +2906,9 @@ export function App(): JSX.Element {
             </button>
           </div>
         </div>
-      </section>
+      </section> : null}
 
-      <section className="panel automation-spotlight">
+      {showOverviewPrelude ? <section className="panel automation-spotlight">
         <div className="panel-header">
           <h2>Automation Operations</h2>
           <div className="panel-actions">
@@ -2310,7 +2950,7 @@ export function App(): JSX.Element {
             <p>{runtimeStatus?.blockedDailyLimitCount ?? 0}</p>
           </article>
         </div>
-      </section>
+      </section> : null}
 
       <section className="panel-tabs" role="tablist" aria-label="Dashboard sections">
         <button
@@ -2339,6 +2979,18 @@ export function App(): JSX.Element {
           onClick={() => setActivePanel("devices")}
         >
           Devices
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activePanel === "graphs"}
+          className={`tab-chip ${activePanel === "graphs" ? "active" : ""}`}
+          onClick={() => {
+            setActivePanel("graphs");
+            void fetchGraphHistory();
+          }}
+        >
+          Graphs
         </button>
         <button
           type="button"
@@ -2478,7 +3130,7 @@ export function App(): JSX.Element {
                 <li key={point.plantId} className="snapshot-item">
                   <strong>{plantLookup.get(point.plantId) ?? point.plantId}</strong>
                   <span>
-                    Moisture {point.moisture}% | Light {point.light} lx | Temp {point.temperature}C |{" "}
+                    Moisture {point.moisture}% | Light {point.light} lx | Temp {point.temperature} |{" "}
                     {new Date(point.capturedAt).toLocaleString()}
                   </span>
                 </li>
@@ -2533,7 +3185,7 @@ export function App(): JSX.Element {
                       return latestTelemetry ? (
                         <p className="muted">
                           Latest telemetry: Moisture {formatMeasurement(latestTelemetry.moisture, "%")} | Light{" "}
-                          {formatMeasurement(latestTelemetry.light)} | Temp {formatMeasurement(latestTelemetry.temperature, "C")}
+                          {formatMeasurement(latestTelemetry.light)} | Temp {formatMeasurement(latestTelemetry.temperature)}
                         </p>
                       ) : (
                         <p className="muted">No telemetry yet</p>
@@ -2683,7 +3335,7 @@ export function App(): JSX.Element {
       ) : null}
 
       {activePanel === "devices" ? (
-        <section className="split">
+        <section className="split devices-layout">
           <section className="panel">
             <div className="panel-header">
               <h2>Hardware Setup</h2>
@@ -2852,6 +3504,25 @@ export function App(): JSX.Element {
                         >
                           {channelProbeLoading ? "Probing..." : "Probe Channels"}
                         </button>
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() =>
+                            setDeviceChannelAssignments((prev) => {
+                              const channel = nextManualOutputChannel(prev);
+                              return [
+                                ...prev,
+                                {
+                                  ...createAssignmentDraft(channel, false),
+                                  ioType: "output",
+                                  outputLabel: channel,
+                                },
+                              ];
+                            })
+                          }
+                        >
+                          Add Output Channel
+                        </button>
                       </div>
                       <p className="muted">
                         Connect first, probe live payload channels, then assign each channel to a plant and measurement.
@@ -2869,15 +3540,31 @@ export function App(): JSX.Element {
                       ) : (
                         <div className="hardware-channel-assignment-list">
                           {deviceChannelAssignments.map((assignment, index) => (
-                            <div className="hardware-form-grid" key={`assignment-${assignment.channel}-${index}`}>
+                            <div className="hardware-form-grid channel-assignment-card" key={`assignment-${assignment.channel}-${index}`}>
                           <div className="hardware-field">
                             <label>Channel</label>
-                            <input value={assignment.channel} readOnly />
+                            <input
+                              value={assignment.channel}
+                              readOnly={assignment.discovered}
+                              onChange={(event) =>
+                                setDeviceChannelAssignments((prev) =>
+                                  prev.map((entry, entryIndex) =>
+                                    entryIndex === index
+                                      ? {
+                                          ...entry,
+                                          channel: event.target.value,
+                                        }
+                                      : entry,
+                                  ),
+                                )
+                              }
+                            />
                           </div>
                           <div className="hardware-field">
                             <label>Plant</label>
                             <select
                               value={assignment.plantId}
+                              disabled={assignment.ioType === "output"}
                               onChange={(event) =>
                                 setDeviceChannelAssignments((prev) =>
                                   prev.map((entry, entryIndex) =>
@@ -2903,6 +3590,7 @@ export function App(): JSX.Element {
                             <label>Measurement Type</label>
                             <select
                               value={assignment.measurementType}
+                              disabled={assignment.ioType === "output"}
                               onChange={(event) =>
                                 setDeviceChannelAssignments((prev) =>
                                   prev.map((entry, entryIndex) =>
@@ -2924,7 +3612,70 @@ export function App(): JSX.Element {
                             </select>
                           </div>
 
-                          {assignment.measurementType === "moisture" ? (
+                          <div className="hardware-field">
+                            <label>I/O Mode</label>
+                            <select
+                              value={assignment.ioType}
+                              onChange={(event) =>
+                                setDeviceChannelAssignments((prev) =>
+                                  prev.map((entry, entryIndex) =>
+                                    entryIndex === index
+                                      ? {
+                                          ...entry,
+                                          ioType: event.target.value as DeviceAssignmentIoType,
+                                          ...(event.target.value === "output"
+                                            ? { plantId: "" }
+                                            : { outputLabel: entry.outputLabel || entry.channel }),
+                                        }
+                                      : entry,
+                                  ),
+                                )
+                              }
+                            >
+                              <option value="input">Input (telemetry)</option>
+                              <option value="output">Output (action target)</option>
+                            </select>
+                          </div>
+
+                          {!assignment.discovered ? (
+                            <div className="hardware-field">
+                              <label>&nbsp;</label>
+                              <button
+                                type="button"
+                                className="ghost-button"
+                                onClick={() =>
+                                  setDeviceChannelAssignments((prev) => prev.filter((_, entryIndex) => entryIndex !== index))
+                                }
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ) : null}
+
+                          {assignment.ioType === "output" ? (
+                            <div className="hardware-field">
+                              <label>Output Label</label>
+                              <input
+                                value={assignment.outputLabel}
+                                placeholder="Irrigation Valve"
+                                onChange={(event) =>
+                                  setDeviceChannelAssignments((prev) =>
+                                    prev.map((entry, entryIndex) =>
+                                      entryIndex === index
+                                        ? {
+                                            ...entry,
+                                            outputLabel: event.target.value,
+                                          }
+                                        : entry,
+                                    ),
+                                  )
+                                }
+                              />
+                              <small className="field-hint">
+                                This output will appear in flow action target options.
+                              </small>
+                            </div>
+                          ) : assignment.measurementType === "moisture" ? (
                             <>
                               <div className="hardware-field">
                                 <label>Input Min</label>
@@ -2966,6 +3717,51 @@ export function App(): JSX.Element {
                                 <small className="field-hint">
                                   Values map to 0-100 using (max - raw) / (max - min).
                                 </small>
+                              </div>
+                            </>
+                          ) : assignment.measurementType === "temperature" ? (
+                            <>
+                              <div className="hardware-field">
+                                <label>Input Unit</label>
+                                <select
+                                  value={assignment.temperatureInputUnit}
+                                  onChange={(event) =>
+                                    setDeviceChannelAssignments((prev) =>
+                                      prev.map((entry, entryIndex) =>
+                                        entryIndex === index
+                                          ? {
+                                              ...entry,
+                                              temperatureInputUnit: event.target.value as DeviceTemperatureUnit,
+                                            }
+                                          : entry,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  <option value="celsius">Celsius (C)</option>
+                                  <option value="fahrenheit">Fahrenheit (F)</option>
+                                </select>
+                              </div>
+                              <div className="hardware-field">
+                                <label>Display Unit</label>
+                                <select
+                                  value={assignment.temperatureOutputUnit}
+                                  onChange={(event) =>
+                                    setDeviceChannelAssignments((prev) =>
+                                      prev.map((entry, entryIndex) =>
+                                        entryIndex === index
+                                          ? {
+                                              ...entry,
+                                              temperatureOutputUnit: event.target.value as DeviceTemperatureUnit,
+                                            }
+                                          : entry,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  <option value="celsius">Celsius (C)</option>
+                                  <option value="fahrenheit">Fahrenheit (F)</option>
+                                </select>
                               </div>
                             </>
                           ) : null}
@@ -3030,7 +3826,7 @@ export function App(): JSX.Element {
                       </div>
                       <p className="muted">
                         Moisture {formatMeasurement(entry.point.moisture, "%")} | Light{" "}
-                        {formatMeasurement(entry.point.light)} | Temp {formatMeasurement(entry.point.temperature, "C")} | Humidity{" "}
+                        {formatMeasurement(entry.point.light)} | Temp {formatMeasurement(entry.point.temperature)} | Humidity{" "}
                         {formatMeasurement(entry.point.humidity, "%")} | Reservoir {formatMeasurement(entry.point.reservoirLevel, "%")}
                       </p>
                       <p className="muted">
@@ -3082,7 +3878,11 @@ export function App(): JSX.Element {
                     {profile.channelAssignments.length > 0
                       ? profile.channelAssignments
                           .map((assignment) => {
-                            const plantName = plantLookup.get(assignment.plantId) ?? assignment.plantId;
+                            if ((assignment.ioType ?? "input") === "output") {
+                              return `${assignment.channel} -> output/${assignment.outputLabel ?? assignment.channel}`;
+                            }
+
+                            const plantName = plantLookup.get(String(assignment.plantId ?? "")) ?? assignment.plantId;
                             return `${assignment.channel} -> ${plantName}/${assignment.measurementType}`;
                           })
                           .join(" | ")
@@ -3137,6 +3937,120 @@ export function App(): JSX.Element {
               ))}
             </ul>
           </section>
+        </section>
+      ) : null}
+
+      {activePanel === "graphs" ? (
+        <section className="panel graphs-panel">
+          <div className="panel-header">
+            <h2>Plant Graphs</h2>
+            <div className="panel-actions">
+              <button type="button" className="ghost-button" onClick={() => void fetchGraphHistory()} disabled={graphHistoryLoading}>
+                {graphHistoryLoading ? "Refreshing..." : "Refresh History"}
+              </button>
+            </div>
+          </div>
+
+          <div className="graphs-controls">
+            <label>
+              <span>Range</span>
+              <select
+                value={graphRange}
+                onChange={(event) => {
+                  setGraphRange(event.target.value as GraphRange);
+                }}
+              >
+                {graphRangeOptions.map((option) => (
+                  <option key={`graph-range-${option.value}`} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>View</span>
+              <select
+                value={graphViewMode}
+                onChange={(event) => setGraphViewMode(event.target.value as GraphViewMode)}
+              >
+                <option value="allPlantsSingleMetric">All plants, one metric</option>
+                <option value="singlePlantOverlay">Single plant, overlay metrics</option>
+              </select>
+            </label>
+            <label>
+              <span>Metric</span>
+              <select
+                value={graphMetric}
+                onChange={(event) => setGraphMetric(event.target.value as GraphMetric)}
+                disabled={graphViewMode !== "allPlantsSingleMetric"}
+              >
+                {graphMetricOptions.map((option) => (
+                  <option key={`graph-metric-${option.value}`} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Plant</span>
+              <select
+                value={graphSelectedPlantId}
+                onChange={(event) => setGraphSelectedPlantId(event.target.value)}
+                disabled={graphViewMode !== "singlePlantOverlay"}
+              >
+                {graphPlantOptions.map((option) => (
+                  <option key={`graph-plant-${option.id}`} value={option.id}>
+                    {option.nickname}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          {graphHistoryError ? <p className="muted">Graph history error: {graphHistoryError}</p> : null}
+
+          <div className="graphs-hero">
+            <div className="graphs-canvas-wrap">
+              {graphChartDataSmoothed.length === 0 ? (
+                <p className="muted">No telemetry history for this range yet.</p>
+              ) : (
+                <ResponsiveContainer width="100%" height={460}>
+                  <LineChart data={graphChartDataSmoothed} margin={{ top: 14, right: 18, bottom: 14, left: 4 }}>
+                    <CartesianGrid stroke="#2a4055" strokeDasharray="4 4" />
+                    <XAxis
+                      type="number"
+                      dataKey="ts"
+                      domain={[graphRangeDomain[0], graphRangeDomain[1]]}
+                      tickFormatter={(value) => formatGraphTick(Number(value), graphRange)}
+                      minTickGap={20}
+                      stroke="#8fb1cd"
+                    />
+                    <YAxis stroke="#8fb1cd" />
+                    <Tooltip
+                      labelFormatter={(value) => formatGraphTooltipLabel(Number(value), graphRange)}
+                      contentStyle={{ background: "#0d1c2c", border: "1px solid #36516e", borderRadius: "10px" }}
+                      labelStyle={{ color: "#cae0f3" }}
+                    />
+                    <Legend wrapperStyle={{ color: "#9bb4c9" }} />
+                    {graphLineDefinitions.map((line) => (
+                      <Line
+                        key={`graph-line-${line.key}`}
+                        type="monotone"
+                        dataKey={line.key}
+                        stroke={line.color}
+                        strokeWidth={2.5}
+                        dot={false}
+                        activeDot={false}
+                        connectNulls
+                        name={line.label}
+                        isAnimationActive={false}
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </div>
         </section>
       ) : null}
 
@@ -3281,6 +4195,74 @@ export function App(): JSX.Element {
               })}
             </ul>
         </section>
+      ) : null}
+
+      {showMobileTabbar ? (
+        <nav className="mobile-tabbar" aria-label="Mobile navigation" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "overview"}
+            className={`mobile-tab ${activePanel === "overview" ? "active" : ""}`}
+            onClick={() => setActivePanel("overview")}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Home</span>
+            <span className="mobile-tab-label">Overview</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "plants"}
+            className={`mobile-tab ${activePanel === "plants" ? "active" : ""}`}
+            onClick={() => setActivePanel("plants")}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Plants</span>
+            <span className="mobile-tab-label">Plants</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "devices"}
+            className={`mobile-tab ${activePanel === "devices" ? "active" : ""}`}
+            onClick={() => setActivePanel("devices")}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Devices</span>
+            <span className="mobile-tab-label">Devices</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "graphs"}
+            className={`mobile-tab ${activePanel === "graphs" ? "active" : ""}`}
+            onClick={() => {
+              setActivePanel("graphs");
+              void fetchGraphHistory();
+            }}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Graphs</span>
+            <span className="mobile-tab-label">Graphs</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "logs"}
+            className={`mobile-tab ${activePanel === "logs" ? "active" : ""}`}
+            onClick={() => setActivePanel("logs")}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Logs</span>
+            <span className="mobile-tab-label">Logs</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePanel === "flows"}
+            className={`mobile-tab ${activePanel === "flows" ? "active" : ""}`}
+            onClick={() => setActivePanel("flows")}
+          >
+            <span className="mobile-tab-icon" aria-hidden="true">Flows</span>
+            <span className="mobile-tab-label">Flows</span>
+          </button>
+        </nav>
       ) : null}
 
       {isPlantModalOpen ? (

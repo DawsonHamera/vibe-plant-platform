@@ -9,6 +9,8 @@ type Row = {
   transport_target: string;
   channel_map: string;
   calibration: string;
+  plant_ids?: string;
+  channel_assignments?: string;
   is_live: number;
   created_at: string;
   updated_at: string;
@@ -30,9 +32,11 @@ describe("DevicesService", () => {
                 transport_target: String(args[3]),
                 channel_map: String(args[4]),
                 calibration: String(args[5]),
-                is_live: Number(args[6]),
-                created_at: String(args[7]),
-                updated_at: String(args[8]),
+                plant_ids: String(args[6]),
+                channel_assignments: String(args[7]),
+                is_live: Number(args[8]),
+                created_at: String(args[9]),
+                updated_at: String(args[10]),
               });
             },
           };
@@ -53,19 +57,26 @@ describe("DevicesService", () => {
         if (sql.includes("UPDATE device_profiles SET")) {
           if (sql.includes("name = ?")) {
             return {
-              run: (
-                name: string,
-                channelMap: string,
-                calibration: string,
-                isLive: number,
-                updatedAt: string,
-                id: string,
-              ) => {
+              run: (...args: unknown[]) => {
+                const name = String(args[0]);
+                const connectionType = args[1] as Row["connection_type"];
+                const transportTarget = String(args[2]);
+                const channelMap = String(args[3]);
+                const calibration = String(args[4]);
+                const plantIds = String(args[5]);
+                const channelAssignments = String(args[6]);
+                const isLive = Number(args[7]);
+                const updatedAt = String(args[8]);
+                const id = String(args[9]);
                 const row = rows.find((item) => item.id === id);
                 if (row) {
                   row.name = name;
+                  row.connection_type = connectionType;
+                  row.transport_target = transportTarget;
                   row.channel_map = channelMap;
                   row.calibration = calibration;
+                  row.plant_ids = plantIds;
+                  row.channel_assignments = channelAssignments;
                   row.is_live = isLive;
                   row.updated_at = updatedAt;
                 }
@@ -103,8 +114,23 @@ describe("DevicesService", () => {
         test: async (target: string) => ({ ok: target.length > 0, latencyMs: 12, message: "ok" }),
       }),
     };
+    const plantsService = {
+      getById: (id: string) => ({ id }),
+    };
+    const telemetryState = {
+      record: () => undefined,
+    };
+    const telemetryTransport = {
+      publishTelemetry: () => undefined,
+    };
 
-    const service = new DevicesService(sqlite as never, adapterRegistry as never);
+    const service = new DevicesService(
+      sqlite as never,
+      adapterRegistry as never,
+      plantsService as never,
+      telemetryState as never,
+      telemetryTransport as never,
+    );
 
     const discovered = await service.discover();
     expect(discovered.length).toBe(3);
@@ -115,6 +141,18 @@ describe("DevicesService", () => {
       transportTarget: "COM3",
       channelMap: { moisture: "ch0", light: "ch1", temperature: "ch2" },
       calibration: { moistureDry: 900, moistureWet: 300 },
+      channelAssignments: [
+        {
+          channel: "ch0",
+          plantId: "plant-1",
+          measurementType: "moisture",
+          calibration: {
+            inputMin: 300,
+            inputMax: 900,
+            clamp: true,
+          },
+        },
+      ],
       isLive: false,
     });
 
@@ -187,13 +225,110 @@ describe("DevicesService", () => {
         test: async () => ({ ok: true, latencyMs: 12, message: "ok" }),
       }),
     };
+    const plantsService = {
+      getById: (id: string) => ({ id }),
+    };
+    const telemetryState = {
+      record: () => undefined,
+    };
+    const telemetryTransport = {
+      publishTelemetry: () => undefined,
+    };
 
-    const service = new DevicesService(sqlite as never, adapterRegistry as never);
+    const service = new DevicesService(
+      sqlite as never,
+      adapterRegistry as never,
+      plantsService as never,
+      telemetryState as never,
+      telemetryTransport as never,
+    );
 
     const validation = service.validateProfile("profile-1");
     expect(validation.ok).toBe(false);
     expect(validation.issues.length).toBeGreaterThan(0);
 
     expect(() => service.setProfileLiveMode("profile-1", true)).toThrow(BadRequestException);
+  });
+
+  it("converts temperature values using assignment input/output units", () => {
+    const rows: Row[] = [
+      {
+        id: "profile-temp",
+        name: "Temp Profile",
+        connection_type: "serial",
+        transport_target: "COM6",
+        channel_map: JSON.stringify({}),
+        calibration: JSON.stringify({}),
+        plant_ids: JSON.stringify(["plant-1"]),
+        channel_assignments: JSON.stringify([
+          {
+            channel: "t1",
+            plantId: "plant-1",
+            measurementType: "temperature",
+            calibration: {
+              inputUnit: "fahrenheit",
+              outputUnit: "celsius",
+            },
+          },
+        ]),
+        is_live: 1,
+        created_at: "2026-03-16T00:00:00.000Z",
+        updated_at: "2026-03-16T00:00:00.000Z",
+      },
+    ];
+
+    const database = {
+      prepare: (sql: string) => {
+        if (sql.includes("SELECT * FROM device_profiles WHERE id")) {
+          return {
+            get: (id: string) => rows.find((row) => row.id === id),
+          };
+        }
+
+        return {
+          all: () => [],
+          get: () => undefined,
+          run: () => undefined,
+        };
+      },
+    };
+
+    const recordedPoints: Array<Record<string, unknown>> = [];
+    const sqlite = { database };
+    const adapterRegistry = {
+      entries: () => [],
+      get: () => ({
+        test: async () => ({ ok: true, latencyMs: 12, message: "ok" }),
+      }),
+    };
+    const plantsService = {
+      getById: (id: string) => ({ id }),
+    };
+    const telemetryState = {
+      record: (point: Record<string, unknown>) => recordedPoints.push(point),
+    };
+    const telemetryTransport = {
+      publishTelemetry: () => undefined,
+    };
+
+    const service = new DevicesService(
+      sqlite as never,
+      adapterRegistry as never,
+      plantsService as never,
+      telemetryState as never,
+      telemetryTransport as never,
+    );
+
+    const result = service.ingestProfileReading("profile-temp", {
+      channels: {
+        t1: 77,
+      },
+      capturedAt: "2026-03-16T00:01:00.000Z",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.forwardedCount).toBe(1);
+    expect(result.readings[0]?.values.temperature).toBe(25);
+    expect(recordedPoints.length).toBe(1);
   });
 });
