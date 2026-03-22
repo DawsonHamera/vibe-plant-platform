@@ -233,20 +233,34 @@ export class SerialAdapter implements DeviceAdapter {
     return this.runChannelProbe(command, target);
   }
 
-  private probeChannelsOnUnix(target: string): Promise<AdapterChannelProbeResult> {
+  private async probeChannelsOnUnix(target: string): Promise<AdapterChannelProbeResult> {
     const sttyFlag = process.platform === "darwin" ? "-f" : "-F";
     const escapedTarget = this.escapePosixArg(target);
-    const command =
+    const fastCommand =
+      `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 1 time 3 >/dev/null 2>&1; ` +
+      `cat ${escapedTarget} | head -n 1"`;
+
+    console.log(`[SERIAL DEBUG] probeChannelsOnUnix fast command: ${fastCommand}`);
+    const fastResult = await this.runChannelProbe(fastCommand, target, 2500);
+    if (fastResult.ok) {
+      return fastResult;
+    }
+
+    const fallbackCommand =
       `sh -lc "stty ${sttyFlag} ${escapedTarget} 9600 -echo -icanon min 1 time 20 >/dev/null 2>&1; ` +
       `cat ${escapedTarget} | head -n 5"`;
 
-    console.log(`[SERIAL DEBUG] probeChannelsOnUnix command: ${command}`);
-    return this.runChannelProbe(command, target);
+    console.log(`[SERIAL DEBUG] probeChannelsOnUnix fallback command: ${fallbackCommand}`);
+    return this.runChannelProbe(fallbackCommand, target, 9000);
   }
 
-  private runChannelProbe(command: string, target: string): Promise<AdapterChannelProbeResult> {
+  private runChannelProbe(
+    command: string,
+    target: string,
+    timeoutMs = 9000,
+  ): Promise<AdapterChannelProbeResult> {
     return new Promise<AdapterChannelProbeResult>((resolve) => {
-      exec(command, { timeout: 12000 }, (error, stdout, stderr) => {
+      exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
         const sample = stdout.trim();
 
         if (error) {
