@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { exec } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, readlink } from "node:fs/promises";
 import {
   AdapterChannelProbeResult,
   AdapterTestResult,
@@ -120,12 +120,27 @@ export class SerialAdapter implements DeviceAdapter {
       };
     }
 
+    // Resolve symlinks to actual device file
+    let resolvedTarget = normalizedTarget;
+    if (normalizedTarget.includes("/dev/serial/by-")) {
+      try {
+        resolvedTarget = await readlink(normalizedTarget);
+        // If readlink returns relative path, prepend /dev/
+        if (!resolvedTarget.startsWith("/")) {
+          resolvedTarget = `/dev/${resolvedTarget}`;
+        }
+        console.log(`[SERIAL DEBUG] test: Resolved symlink ${normalizedTarget} -> ${resolvedTarget}`);
+      } catch (e) {
+        console.log(`[SERIAL DEBUG] test: Failed to resolve symlink: ${(e as Error).message}`);
+      }
+    }
+
     if (process.platform === "win32") {
       return this.testOnWindows(normalizedTarget);
     }
 
     if (process.platform === "linux" || process.platform === "darwin") {
-      return this.testOnUnix(normalizedTarget);
+      return this.testOnUnix(resolvedTarget);
     }
 
     return {
@@ -193,12 +208,28 @@ export class SerialAdapter implements DeviceAdapter {
       };
     }
 
+    // Resolve symlinks to actual device file
+    let resolvedTarget = normalizedTarget;
+    if (normalizedTarget.includes("/dev/serial/by-")) {
+      try {
+        resolvedTarget = await readlink(normalizedTarget);
+        // If readlink returns relative path, prepend /dev/
+        if (!resolvedTarget.startsWith("/")) {
+          resolvedTarget = `/dev/${resolvedTarget}`;
+        }
+        console.log(`[SERIAL DEBUG] Resolved symlink ${normalizedTarget} -> ${resolvedTarget}`);
+      } catch (e) {
+        console.log(`[SERIAL DEBUG] Failed to resolve symlink: ${(e as Error).message}`);
+        // Fall back to original target if resolution fails
+      }
+    }
+
     if (process.platform === "win32") {
       return this.probeChannelsOnWindows(normalizedTarget);
     }
 
     if (process.platform === "linux" || process.platform === "darwin") {
-      return this.probeChannelsOnUnix(normalizedTarget);
+      return this.probeChannelsOnUnix(resolvedTarget);
     }
 
     return {
