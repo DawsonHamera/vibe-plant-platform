@@ -1,17 +1,8 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PlantRecord, TelemetryPoint } from "@vibe/shared";
 import { io } from "socket.io-client";
-import {
-  Brush,
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import Chart from "react-apexcharts";
+import type { ApexAxisChartSeries, ApexOptions } from "apexcharts";
 import ReactFlow, {
   Background,
   ConnectionLineType,
@@ -915,7 +906,6 @@ export function App(): JSX.Element {
   const [graphViewMode, setGraphViewMode] = useState<GraphViewMode>("allPlantsSingleMetric");
   const [graphMetric, setGraphMetric] = useState<GraphMetric>("moisture");
   const [graphSelectedPlantId, setGraphSelectedPlantId] = useState<string>("");
-  const [graphBrushRange, setGraphBrushRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
   const [mobileDeviceMode, setMobileDeviceMode] = useState(false);
   const [quickActionsOpen, setQuickActionsOpen] = useState(false);
   const [isPlantModalOpen, setIsPlantModalOpen] = useState(false);
@@ -2535,9 +2525,143 @@ export function App(): JSX.Element {
     }));
   }, [graphHistory, graphViewMode, plantLookup]);
 
-  useEffect(() => {
-    setGraphBrushRange(null);
-  }, [graphRange, graphViewMode, graphMetric, graphSelectedPlantId]);
+  const graphSeries = useMemo<ApexAxisChartSeries>(() => {
+    const series = graphLineDefinitions
+      .map((line) => {
+        const points = graphChartDataRenderable
+          .map((entry) => {
+            const value = entry[line.key];
+            if (typeof value !== "number" || Number.isNaN(value)) {
+              return null;
+            }
+
+            return [Number(entry.ts), value] as [number, number];
+          })
+          .filter((value): value is [number, number] => value !== null);
+
+        return {
+          name: line.label,
+          data: points,
+        };
+      })
+      .filter((entry) => entry.data.length > 0);
+
+    return series;
+  }, [graphChartDataRenderable, graphLineDefinitions]);
+
+  const graphMetricLabel = useMemo(
+    () => graphMetricOptions.find((option) => option.value === graphMetric)?.label ?? "Metric",
+    [graphMetric],
+  );
+
+  const graphMetricUnit = useMemo(
+    () => graphMetricOptions.find((option) => option.value === graphMetric)?.unit ?? "",
+    [graphMetric],
+  );
+
+  const graphOptions = useMemo<ApexOptions>(
+    () => ({
+      chart: {
+        type: "line",
+        background: "transparent",
+        toolbar: { show: false },
+        zoom: { enabled: false },
+        animations: {
+          enabled: true,
+          easing: "linear",
+          dynamicAnimation: {
+            speed: 280,
+          },
+        },
+      },
+      colors: graphLineDefinitions.map((line) => line.color),
+      stroke: {
+        curve: "smooth",
+        width: 2.5,
+      },
+      markers: {
+        size: 0,
+        hover: {
+          sizeOffset: 4,
+        },
+      },
+      grid: {
+        borderColor: "#2a4055",
+        strokeDashArray: 4,
+      },
+      dataLabels: {
+        enabled: false,
+      },
+      xaxis: {
+        type: "datetime",
+        min: graphRangeDomain[0],
+        max: graphRangeDomain[1],
+        labels: {
+          style: {
+            colors: "#8fb1cd",
+          },
+          formatter: (value) => formatGraphTick(Number(value), graphRange),
+        },
+      },
+      yaxis: {
+        labels: {
+          style: {
+            colors: "#8fb1cd",
+          },
+          formatter:
+            graphViewMode === "allPlantsSingleMetric"
+              ? (value) => `${Math.round(value * 100) / 100}${graphMetricUnit}`
+              : (value) => `${Math.round(value * 100) / 100}`,
+        },
+        title:
+          graphViewMode === "allPlantsSingleMetric"
+            ? {
+                text: `${graphMetricLabel}${graphMetricUnit ? ` (${graphMetricUnit})` : ""}`,
+                style: {
+                  color: "#9bb4c9",
+                },
+              }
+            : undefined,
+      },
+      tooltip: {
+        shared: true,
+        intersect: false,
+        theme: "dark",
+        x: {
+          formatter: (value) => formatGraphTooltipLabel(Number(value), graphRange),
+        },
+        y: {
+          formatter: (value) => (value === undefined ? "-" : `${Math.round(value * 100) / 100}`),
+        },
+      },
+      legend: {
+        show: true,
+        labels: {
+          colors: "#9bb4c9",
+        },
+      },
+      noData: {
+        text: "No telemetry history for this range yet.",
+        align: "center",
+        verticalAlign: "middle",
+        style: {
+          color: "#9bb4c9",
+          fontSize: "13px",
+        },
+      },
+    }),
+    [
+      graphLineDefinitions,
+      graphMetricLabel,
+      graphMetricUnit,
+      graphRange,
+      graphRangeDomain,
+      graphViewMode,
+    ],
+  );
+
+  const graphHasData = graphSeries.some((entry) => entry.data.length > 0);
+
   const editorProfile = useMemo(
     () => deviceProfiles.find((profile) => profile.id === deviceEditorProfileId) ?? null,
     [deviceEditorProfileId, deviceProfiles],
@@ -3875,76 +3999,13 @@ export function App(): JSX.Element {
 
           <div className="graphs-hero">
             <div className="graphs-canvas-wrap">
-              {graphChartDataRenderable.length === 0 ? (
+              {!graphHasData ? (
                 <p className="muted">No telemetry history for this range yet.</p>
               ) : (
-                <ResponsiveContainer width="100%" height={460}>
-                  <LineChart
-                    data={graphChartDataRenderable}
-                    margin={{ top: 14, right: 18, bottom: 14, left: 4 }}
-                  >
-                    <CartesianGrid stroke="#2a4055" strokeDasharray="4 4" />
-                    <XAxis
-                      type="number"
-                      dataKey="ts"
-                      domain={[graphRangeDomain[0], graphRangeDomain[1]]}
-                      tickFormatter={(value) => formatGraphTick(Number(value), graphRange)}
-                      minTickGap={20}
-                      stroke="#8fb1cd"
-                    />
-                    <YAxis stroke="#8fb1cd" />
-                    <Tooltip
-                      labelFormatter={(value) => formatGraphTooltipLabel(Number(value), graphRange)}
-                      contentStyle={{ background: "#0d1c2c", border: "1px solid #36516e", borderRadius: "10px" }}
-                      labelStyle={{ color: "#cae0f3" }}
-                    />
-                    <Legend wrapperStyle={{ color: "#9bb4c9" }} />
-                    {graphLineDefinitions.map((line) => (
-                      <Line
-                        key={`graph-line-${line.key}`}
-                        type="monotone"
-                        dataKey={line.key}
-                        stroke={line.color}
-                        strokeWidth={2.5}
-                        dot={false}
-                        activeDot={false}
-                        connectNulls
-                        name={line.label}
-                        isAnimationActive={false}
-                      />
-                    ))}
-                    <Brush
-                      dataKey="ts"
-                      height={26}
-                      stroke="#4fdad3"
-                      travellerWidth={10}
-                      startIndex={graphBrushRange?.startIndex}
-                      endIndex={graphBrushRange?.endIndex}
-                      onChange={(next) => {
-                        if (!next || next.startIndex === undefined || next.endIndex === undefined) {
-                          setGraphBrushRange(null);
-                          return;
-                        }
-
-                        setGraphBrushRange({
-                          startIndex: Number(next.startIndex),
-                          endIndex: Number(next.endIndex),
-                        });
-                      }}
-                      tickFormatter={(value) => formatGraphTick(Number(value), graphRange)}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
+                <Chart options={graphOptions} series={graphSeries} type="line" height={460} />
               )}
             </div>
-            <div className="inline-actions">
-              <button type="button" className="ghost-button" onClick={() => setGraphBrushRange(null)}>
-                Reset Zoom
-              </button>
-              <small className="muted">
-                Live updates stream continuously. Drag the range handles to zoom the timeline.
-              </small>
-            </div>
+            <small className="muted">Live stream is always on. Use Range to shift the time window.</small>
           </div>
         </section>
       ) : null}
