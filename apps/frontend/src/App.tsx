@@ -389,6 +389,15 @@ const graphHistoryFetchRangeByRange: Record<GraphRange, "day" | "week" | "month"
 
 const maxGraphHistoryPoints = 50_000;
 const maxRenderableGraphPoints = 1_200;
+const graphLiveRetentionMs = graphRangeWindowMs.year + 2 * 24 * 60 * 60 * 1000;
+const graphBucketMsByRange: Record<GraphRange, number> = {
+  minute: 1000,
+  hour: 5 * 1000,
+  day: 60 * 1000,
+  week: 5 * 60 * 1000,
+  month: 15 * 60 * 1000,
+  year: 2 * 60 * 60 * 1000,
+};
 
 const formatGraphTick = (timestamp: number, range: GraphRange): string => {
   const date = new Date(timestamp);
@@ -1172,7 +1181,6 @@ export function App(): JSX.Element {
 
   const fetchGraphHistory = useCallback(async (): Promise<void> => {
     const requestSeq = ++graphHistoryRequestSeqRef.current;
-    const requestStartedAt = Date.now();
     setGraphHistoryLoading(true);
     setGraphHistoryError(null);
 
@@ -1206,10 +1214,14 @@ export function App(): JSX.Element {
       }
 
       setGraphHistory((prev) => {
-        const recentLivePoints = prev.filter((point) => Date.parse(point.capturedAt) > requestStartedAt);
         const mergedByKey = new Map<string, PlantGraphPoint>();
+        const retentionCutoff = Date.now() - graphLiveRetentionMs;
 
-        for (const point of [...next, ...recentLivePoints]) {
+        for (const point of [...prev, ...next]) {
+          const ts = Date.parse(point.capturedAt);
+          if (!Number.isFinite(ts) || ts < retentionCutoff) {
+            continue;
+          }
           mergedByKey.set(`${point.plantId}|${point.capturedAt}`, point);
         }
 
@@ -1226,7 +1238,6 @@ export function App(): JSX.Element {
       }
 
       setGraphHistoryError(error instanceof Error ? error.message : "Unable to load graph telemetry history.");
-      setGraphHistory([]);
     } finally {
       if (requestSeq === graphHistoryRequestSeqRef.current) {
         setGraphHistoryLoading(false);
@@ -1591,7 +1602,12 @@ export function App(): JSX.Element {
         };
 
         const mergedByKey = new Map<string, PlantGraphPoint>();
+        const retentionCutoff = Date.now() - graphLiveRetentionMs;
         for (const item of [...prev, nextPoint]) {
+          const ts = Date.parse(item.capturedAt);
+          if (!Number.isFinite(ts) || ts < retentionCutoff) {
+            continue;
+          }
           mergedByKey.set(`${item.plantId}|${item.capturedAt}`, item);
         }
 
@@ -2483,13 +2499,10 @@ export function App(): JSX.Element {
   }, [graphHistory, graphMetric, graphSelectedPlantId, graphViewMode]);
 
   const graphRangeDomain = useMemo(() => {
-    const latestTimestamp = graphChartData.length > 0
-      ? Number(graphChartData[graphChartData.length - 1]?.ts)
-      : Date.now();
-    const end = Number.isFinite(latestTimestamp) ? latestTimestamp : Date.now();
+    const end = Date.now();
     const start = end - graphRangeWindowMs[graphRange];
     return [start, end] as const;
-  }, [graphChartData, graphRange]);
+  }, [graphRange]);
 
   const graphChartDataInRange = useMemo(
     () =>
@@ -2500,13 +2513,66 @@ export function App(): JSX.Element {
   );
 
   const graphChartDataRenderable = useMemo(() => {
-    if (graphChartDataInRange.length <= maxRenderableGraphPoints) {
-      return graphChartDataInRange;
+    if (graphChartDataInRange.length === 0) {
+      return [] as GraphChartRow[];
     }
 
-    const stride = Math.ceil(graphChartDataInRange.length / maxRenderableGraphPoints);
-    return graphChartDataInRange.filter((_, index) => index % stride === 0 || index === graphChartDataInRange.length - 1);
-  }, [graphChartDataInRange]);
+    const bucketMs = graphBucketMsByRange[graphRange];
+    const buckets = new Map<number, { sums: Record<string, number>; counts: Record<string, number> }>();
+
+    for (const entry of graphChartDataInRange) {
+      const ts = Number(entry.ts);
+      if (!Number.isFinite(ts)) {
+        continue;
+      }
+
+      const bucketTs = Math.floor(ts / bucketMs) * bucketMs;
+      const current = buckets.get(bucketTs) ?? { sums: {}, counts: {} };
+
+      Object.entries(entry).forEach(([key, value]) => {
+        if (key === "timestamp" || key === "ts") {
+          return;
+        }
+
+        if (typeof value !== "number" || Number.isNaN(value)) {
+          return;
+        }
+
+        current.sums[key] = (current.sums[key] ?? 0) + value;
+        current.counts[key] = (current.counts[key] ?? 0) + 1;
+      });
+
+      buckets.set(bucketTs, current);
+    }
+
+    const bucketed = Array.from(buckets.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([bucketTs, aggregate]) => {
+        const row: GraphChartRow = {
+          timestamp: new Date(bucketTs).toISOString(),
+          ts: bucketTs,
+        };
+
+        Object.keys(aggregate.sums).forEach((key) => {
+          const count = aggregate.counts[key] ?? 0;
+          const sum = aggregate.sums[key];
+          if (!count || sum === undefined) {
+            return;
+          }
+
+          row[key] = Math.round((sum / count) * 100) / 100;
+        });
+
+        return row;
+      });
+
+    if (bucketed.length <= maxRenderableGraphPoints) {
+      return bucketed;
+    }
+
+    const stride = Math.ceil(bucketed.length / maxRenderableGraphPoints);
+    return bucketed.filter((_, index) => index % stride === 0 || index === bucketed.length - 1);
+  }, [graphChartDataInRange, graphRange]);
 
   const graphLineDefinitions = useMemo(() => {
     if (graphViewMode === "allPlantsSingleMetric") {
@@ -2570,7 +2636,7 @@ export function App(): JSX.Element {
           enabled: true,
           easing: "linear",
           dynamicAnimation: {
-            speed: 280,
+            speed: 1000,
           },
         },
       },
@@ -2604,6 +2670,16 @@ export function App(): JSX.Element {
         },
       },
       yaxis: {
+        min:
+          graphViewMode === "allPlantsSingleMetric" &&
+          (graphMetric === "moisture" || graphMetric === "humidity" || graphMetric === "reservoirLevel")
+            ? 0
+            : undefined,
+        max:
+          graphViewMode === "allPlantsSingleMetric" &&
+          (graphMetric === "moisture" || graphMetric === "humidity" || graphMetric === "reservoirLevel")
+            ? 100
+            : undefined,
         labels: {
           style: {
             colors: "#8fb1cd",
