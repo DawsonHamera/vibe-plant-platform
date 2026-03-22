@@ -21,6 +21,7 @@ Monorepo foundation for a production-ready plant management and automation platf
 
 ## Deployment
 - Production deployment and operator procedures: `docs/deployment-runbook.md`
+- Simplified Raspberry Pi + Cloudflare steps: `docs/rpi4-cloudflare-quickstart.md`
 
 ## Production Runtime
 
